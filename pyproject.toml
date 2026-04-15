@@ -1,0 +1,18 @@
+[project]
+name = "bt-trading-tools"
+version = "0.1.0"
+description = "Generic Bittensor trading infrastructure: AMM math, backtesting, network, data loading, trade tracking"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyyaml",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+include = ["bt_trading_tools*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
