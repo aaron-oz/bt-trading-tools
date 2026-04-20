@@ -8,6 +8,7 @@ dependencies = [
     "pandas",
     "pyyaml",
     "scipy",
+    "pydantic>=2.0",
 ]
 
 [tool.setuptools.packages.find]
