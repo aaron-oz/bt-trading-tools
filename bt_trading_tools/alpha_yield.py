@@ -298,20 +298,37 @@ class TaostatsYieldProvider:
 class ChainYieldProvider:
     """Fetch per-subnet daily yield rate directly from the bittensor SDK.
 
-    Derivation uses the on-chain alpha emission per tempo and the total
-    alpha staked on the subnet. Bittensor import is deferred so
-    ``bt-trading-tools`` stays importable in environments without the SDK.
+    Fallback for when taostats is unreachable. Derives an approximate
+    delegator yield rate from on-chain alpha emission and staked alpha.
+    Bittensor import is deferred.
 
-    Formula:
-        tempo_blocks = subnet.tempo           # blocks per tempo (~360)
-        blocks_per_day = 7200                  # 12s block time
-        emission_per_tempo_alpha = subnet.alpha_out_emission
-        daily_alpha_emission = emission_per_tempo_alpha × (blocks_per_day / tempo_blocks)
-        delegator_share = 1 - subnet.validator_take     # approx
-        daily_alpha_to_delegators = daily_alpha_emission × delegator_share
-        rate_per_day = daily_alpha_to_delegators / total_alpha_staked
+    SDK surface (verified against bittensor 9.x):
+
+    * ``sub.subnet(netuid)`` → ``DynamicInfo`` with ``.alpha_out_emission``
+      (Balance, **per-block**), ``.alpha_out`` (Balance, total alpha
+      circulating / staked outside the pool), ``.alpha_in`` (Balance,
+      alpha inside the AMM pool — NOT used here), ``.tempo`` (int).
+      Source: bittensor/core/chain_data/dynamic_info.py.
+
+    Derivation:
+
+        blocks_per_day        = 7200                # ~12s per block
+        daily_alpha_emission  = alpha_out_emission × blocks_per_day
+        daily_to_delegators   = daily_alpha_emission × DELEGATOR_SHARE
+        rate_per_day          = daily_to_delegators / alpha_out_staked
+
+    ``DELEGATOR_SHARE = 0.82`` is a coarse project-wide assumption
+    (Bittensor doesn't expose a per-subnet validator take on
+    DynamicInfo and emission splits vary by consensus). For accurate
+    per-subnet rates use TaostatsYieldProvider — it measures realized
+    delegator APY directly from chain observations.
     """
     source = AlphaYieldSource.CHAIN
+
+    # Coarse project-wide delegator share. Refine only if DynamicInfo
+    # gains a per-subnet validator-take field in a future SDK release.
+    DELEGATOR_SHARE: float = 0.82
+    BLOCKS_PER_DAY: float = 7200.0
 
     def __init__(self, network: str = "finney"):
         self._network = network
@@ -324,25 +341,33 @@ class ChainYieldProvider:
             sub = await get_async_subtensor(self._network)
             try:
                 subnet = await sub.subnet(netuid=netuid)
-                tempo = getattr(subnet, "tempo", 360)
-                alpha_out_emission = _as_float(
+                if subnet is None:
+                    raise ValueError(f"sub.subnet({netuid}) returned None")
+
+                # Balance fields: .tao gives the float in token units.
+                alpha_out_emission_per_block = _balance_to_float(
                     getattr(subnet, "alpha_out_emission", None)
                 )
-                alpha_in = _as_float(getattr(subnet, "alpha_in", None))
-                validator_take = _as_float(
-                    getattr(subnet, "validator_take", 0.18)
-                ) or 0.18
-                if alpha_out_emission is None or alpha_in is None or alpha_in <= 0:
+                alpha_out = _balance_to_float(
+                    getattr(subnet, "alpha_out", None)
+                )
+
+                if (
+                    alpha_out_emission_per_block is None
+                    or alpha_out is None
+                    or alpha_out <= 0
+                ):
                     raise ValueError(
-                        f"chain subnet info missing fields: tempo={tempo}, "
-                        f"alpha_out_emission={alpha_out_emission}, alpha_in={alpha_in}"
+                        f"DynamicInfo missing fields for netuid={netuid}: "
+                        f"alpha_out_emission={alpha_out_emission_per_block}, "
+                        f"alpha_out={alpha_out}"
                     )
-                blocks_per_day = 7200.0
-                tempos_per_day = blocks_per_day / max(float(tempo), 1.0)
-                daily_alpha_emission = alpha_out_emission * tempos_per_day
-                delegator_share = max(0.0, 1.0 - validator_take)
-                daily_to_delegators = daily_alpha_emission * delegator_share
-                return daily_to_delegators / alpha_in
+
+                daily_alpha_emission = (
+                    alpha_out_emission_per_block * self.BLOCKS_PER_DAY
+                )
+                daily_to_delegators = daily_alpha_emission * self.DELEGATOR_SHARE
+                return daily_to_delegators / alpha_out
             finally:
                 try:
                     await sub.close()
@@ -356,14 +381,32 @@ class EmpiricalYieldProvider:
     """Fetch per-subnet daily yield rate from local historical CSVs.
 
     Computes a rolling mean from ``subnet_history.csv`` and
-    ``pool_history.csv`` over the last ``window_days``. Useful when
-    both the chain and taostats are unreachable (or as a conservative
-    default during backtest).
+    ``pool_history.csv`` over the last ``window_days``. Third-tier
+    fallback: only reached if both taostats and the chain RPC are
+    unreachable. Useful as a deterministic default for backtests
+    against historical data.
 
-    Files resolved via ``UnifiedDataLoader`` defaults; override with
-    ``data_dir`` for tests or alternate layouts.
+    Derivation (from ``docs/data-dictionary.md`` §"Data Notes"):
+
+        subnet_history.csv ``emission``      = rao per tempo
+        pool_history.csv ``alpha_staked``    = rao (alpha outside pool)
+        blocks_per_day                       = 7200
+        tempos_per_day                       = blocks_per_day / tempo
+        daily_alpha_emission (rao)           = emission × tempos_per_day
+        daily_to_delegators (rao)            = daily_alpha_emission × DELEGATOR_SHARE
+        rate_per_day (dimensionless)         = daily_to_delegators / alpha_staked
+
+    Both numerator and denominator are in rao so units cancel.
+    ``DELEGATOR_SHARE = 0.82`` matches ``ChainYieldProvider`` — see
+    notes there.
+
+    Files resolved via the ``data_dir`` constructor arg; override for
+    tests or alternate layouts.
     """
     source = AlphaYieldSource.EMPIRICAL
+
+    DELEGATOR_SHARE: float = 0.82
+    BLOCKS_PER_DAY: float = 7200.0
 
     def __init__(
         self,
@@ -408,15 +451,12 @@ class EmpiricalYieldProvider:
         recent_subnet = subnet[subnet["date"] >= cutoff]
         recent_pool = pool[pool["date"] >= cutoff]
 
-        # emission is rao per tempo; tempo needed for TAO/day. If tempo
-        # missing, assume 360.
         tempo = (
             recent_subnet["tempo"].mean()
             if "tempo" in recent_subnet.columns
             else 360.0
         )
-        blocks_per_day = 7200.0
-        tempos_per_day = blocks_per_day / max(float(tempo), 1.0)
+        tempos_per_day = self.BLOCKS_PER_DAY / max(float(tempo), 1.0)
 
         agg_emission = recent_subnet.groupby("netuid")["emission"].mean()
         agg_alpha_staked = recent_pool.groupby("netuid")["alpha_staked"].mean()
@@ -426,10 +466,10 @@ class EmpiricalYieldProvider:
             alpha_staked_rao = agg_alpha_staked.get(netuid)
             if alpha_staked_rao is None or alpha_staked_rao <= 0:
                 continue
-            # Both numerator and denominator are in rao, so the ratio is
-            # dimensionless alpha-per-alpha.
             daily_alpha = em_rao_per_tempo * tempos_per_day
-            out[int(netuid)] = float(daily_alpha / alpha_staked_rao)
+            daily_to_delegators = daily_alpha * self.DELEGATOR_SHARE
+            # Both sides rao → dimensionless rate_per_day.
+            out[int(netuid)] = float(daily_to_delegators / alpha_staked_rao)
 
         self._cache = out
         self._loaded_at = now
@@ -444,6 +484,31 @@ def _finite(x: float) -> bool:
 def _as_float(v) -> Optional[float]:
     if v is None:
         return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _balance_to_float(v) -> Optional[float]:
+    """Coerce a bittensor Balance (or None / raw numeric) to a float in
+    token units. Balance stores rao internally; ``.tao`` returns the
+    float token value regardless of which subnet the Balance is tagged
+    with (the attribute is named ``.tao`` historically; for alpha
+    Balances it holds alpha tokens).
+    """
+    if v is None:
+        return None
+    if hasattr(v, "tao"):
+        try:
+            return float(v.tao)
+        except Exception:
+            pass
+    if hasattr(v, "rao"):
+        try:
+            return float(v.rao) / 1e9
+        except Exception:
+            pass
     try:
         return float(v)
     except (TypeError, ValueError):
