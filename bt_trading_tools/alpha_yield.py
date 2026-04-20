@@ -205,19 +205,36 @@ class ZeroYieldProvider:
 class TaostatsYieldProvider:
     """Fetch per-subnet daily yield rate from taostats.
 
-    Derivation (no single endpoint exposes yield directly):
+    Uses the ``/api/dtao/validator/yield/latest/v1`` endpoint which
+    exposes per-validator APY directly. We take the **stake-weighted
+    mean** of ``thirty_day_apy`` across all validators on the subnet
+    and divide by 365 to convert to a simple-interest daily rate.
 
-        rate_per_day = daily_alpha_distributed_to_delegators /
-                       total_alpha_delegated_on_subnet
+    Stake-weighted is the right aggregation: APY is per-validator and
+    reflects that validator's performance + take; weighting by stake
+    gives the rate a typical delegator on the subnet would observe.
 
-    Both quantities are available from the subnet detail / delegation
-    endpoints. Exact endpoint shapes are subject to taostats API
-    evolution — this is the conservative implementation; refine when
-    the endpoint contract is confirmed during first-run integration.
+    Endpoint reference: https://docs.taostats.io/reference
+    Verified live 2026-04-20. Returns fresh per-block data (stake in rao,
+    APY as a fraction e.g. 0.54 = 54%/yr).
 
-    Reads ``TAOSTATS_API_KEY`` from the environment.
+    Conversion note: APY values are interpreted as simple-interest
+    annual rate — ``rate_per_day = apy / 365``. That matches how the
+    rest of the yield model accrues (linear in days). The continuous-
+    compounding alternative (``log(1+apy)/365``) would give slightly
+    lower daily rates but over-complicates the model for no gain in
+    accuracy.
+
+    Reads ``TAOSTATS_API_KEY`` from the environment if ``api_key`` not
+    passed. Rate limits: 5 req/min free / 240 req/min Pro. With
+    ``cache_ttl_s=3600`` on the model, one call per subnet per hour —
+    well within either tier.
     """
     source = AlphaYieldSource.TAOSTATS
+
+    ENDPOINT_PATH = "/api/dtao/validator/yield/latest/v1"
+    APY_FIELD = "thirty_day_apy"
+    DEFAULT_PAGE_LIMIT = 200   # subnets typically have <100 validators
 
     def __init__(
         self,
@@ -233,9 +250,8 @@ class TaostatsYieldProvider:
     def fetch_rate(self, netuid: int) -> float:
         """Return alpha-per-alpha per-day yield rate.
 
-        NOTE: exact endpoint shape to be confirmed on first VPS run
-        against live taostats. Raises on network / schema errors so the
-        cascade falls through cleanly.
+        Raises on network / schema errors so the cascade falls through
+        cleanly to ChainYieldProvider / EmpiricalYieldProvider / fallback.
         """
         import requests
 
@@ -244,38 +260,39 @@ class TaostatsYieldProvider:
 
         headers = {"Authorization": self._api_key, "accept": "application/json"}
 
-        # Subnet-level totals: daily alpha emission + total delegated alpha.
         resp = requests.get(
-            f"{self._base_url}/api/subnet/latest/v1",
-            params={"netuid": netuid},
+            f"{self._base_url}{self.ENDPOINT_PATH}",
+            params={"netuid": netuid, "limit": self.DEFAULT_PAGE_LIMIT},
             headers=headers,
             timeout=self._timeout_s,
         )
         resp.raise_for_status()
         payload = resp.json()
-        subnet = _first_record(payload)
-
-        # Field names below are the conservative guess; adjust when
-        # taostats schema is verified on first integration run.
-        daily_alpha_to_delegators = _as_float(
-            subnet.get("alpha_emission_to_delegators_daily")
-            or subnet.get("alpha_emission_delegators_daily")
-        )
-        total_alpha_delegated = _as_float(
-            subnet.get("total_alpha_delegated")
-            or subnet.get("alpha_staked_total")
-        )
-
-        if (
-            daily_alpha_to_delegators is None
-            or total_alpha_delegated is None
-            or total_alpha_delegated <= 0
-        ):
+        validators = payload.get("data") or []
+        if not validators:
             raise ValueError(
-                f"taostats subnet response missing yield fields: {payload!r}"
+                f"taostats returned no validators for netuid={netuid}"
             )
 
-        return daily_alpha_to_delegators / total_alpha_delegated
+        # Stake-weighted mean of 30-day APY.
+        total_stake = 0.0
+        weighted_apy = 0.0
+        for v in validators:
+            stake = _as_float(v.get("stake"))
+            apy = _as_float(v.get(self.APY_FIELD))
+            if stake is None or apy is None or stake <= 0 or apy < 0:
+                continue
+            total_stake += stake
+            weighted_apy += apy * stake
+
+        if total_stake <= 0:
+            raise ValueError(
+                f"taostats returned no usable (stake, apy) pairs for "
+                f"netuid={netuid}"
+            )
+
+        apy_mean = weighted_apy / total_stake
+        return apy_mean / 365.0
 
 
 class ChainYieldProvider:

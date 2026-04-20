@@ -352,13 +352,33 @@ class BittensorFeeClient:
     """Concrete ``ChainFeeClient`` backed by the bittensor SDK.
 
     The bittensor import is deferred to method-call time so
-    ``bt-trading-tools`` stays importable in environments without the SDK
-    (tests, CI, local dev without a chain connection). Instantiation
-    itself is cheap — connection is lazy.
+    ``bt-trading-tools`` stays importable in environments without the
+    SDK (tests, CI, local dev without chain access). Instantiation
+    itself is cheap — the WebSocket connection opens lazily on the
+    first call.
 
     Uses ``asyncio.run`` to bridge the async SDK into the sync
-    ``ChainFeeClient`` contract. This matches the existing
-    ``_LivePoolCache`` pattern in quality-dip-bot.
+    ``ChainFeeClient`` contract. Matches the ``_LivePoolCache`` pattern
+    in quality-dip-bot.
+
+    SDK surface verified against bittensor 9.x:
+
+    * ``sub.sim_swap(origin_netuid, destination_netuid, amount)`` returns
+      a ``SimSwapResult`` with ``.tao_fee`` / ``.alpha_fee`` /
+      ``.tao_amount`` / ``.alpha_amount`` (all ``Balance`` objects).
+      origin=0 → add_stake; origin=netuid → remove_stake.
+      Source: bittensor/core/async_subtensor.py::sim_swap (line ~638).
+    * ``sub.compose_call(call_module, call_function, call_params)``
+      validates params against chain metadata then returns a
+      ``GenericCall``. Source: async_subtensor.py::compose_call (line ~5871).
+    * ``sub.get_extrinsic_fee(call, keypair)`` returns a ``Balance``
+      wrapping partial_fee. Source: async_subtensor.py::get_extrinsic_fee
+      (line ~6036).
+    * ``SubtensorModule.add_stake(netuid, hotkey, amount_staked)`` /
+      ``remove_stake(netuid, hotkey, amount_unstaked)`` are the canonical
+      call_params shapes. Source: core/extrinsics/pallets/subtensor_module.py.
+
+    See ``docs/data-sources.md`` in the alpha-trading repo for links.
     """
 
     def __init__(self, network: str = "finney"):
@@ -393,29 +413,26 @@ class BittensorFeeClient:
 
         sub = await get_async_subtensor(self.network)
         try:
-            # Bittensor's sim_swap uses origin/destination conventions:
-            #   add_stake:    origin=0 (root TAO), destination=netuid
-            #   remove_stake: origin=netuid, destination=0
+            # add_stake:    origin=0 (root TAO), destination=netuid
+            # remove_stake: origin=netuid, destination=0
             if operation == "add_stake":
-                result = await sub.sim_swap(
-                    origin_netuid=0,
-                    destination_netuid=netuid,
-                    amount=bt.Balance.from_tao(amount),
-                )
-                return {
-                    "tao_fee": self._balance_to_tao(getattr(result, "tao_fee", None)),
-                    "alpha_fee": self._balance_to_tao(getattr(result, "alpha_fee", None)),
-                }
+                amount_bal = bt.Balance.from_tao(amount)
+                origin, dest = 0, netuid
             else:
-                result = await sub.sim_swap(
-                    origin_netuid=netuid,
-                    destination_netuid=0,
-                    amount=bt.Balance.from_rao(int(amount * 1e9)),  # alpha in rao
-                )
-                return {
-                    "tao_fee": self._balance_to_tao(getattr(result, "tao_fee", None)),
-                    "alpha_fee": self._balance_to_tao(getattr(result, "alpha_fee", None)),
-                }
+                # Alpha is tracked in rao on-chain; amount arg is alpha
+                # tokens, multiply by 1e9 for the Balance representation.
+                amount_bal = bt.Balance.from_rao(int(amount * 1e9))
+                origin, dest = netuid, 0
+
+            result = await sub.sim_swap(
+                origin_netuid=origin,
+                destination_netuid=dest,
+                amount=amount_bal,
+            )
+            return {
+                "tao_fee": _balance_to_tao(getattr(result, "tao_fee", None)),
+                "alpha_fee": _balance_to_tao(getattr(result, "alpha_fee", None)),
+            }
         finally:
             try:
                 await sub.close()
@@ -435,29 +452,23 @@ class BittensorFeeClient:
 
         sub = await get_async_subtensor(self.network)
         try:
-            if operation == "add_stake":
-                call = await sub.substrate.compose_call(
-                    call_module="SubtensorModule",
-                    call_function="add_stake",
-                    call_params={
-                        "hotkey": coldkey_ss58,  # placeholder; any valid SS58 OK
-                        "netuid": netuid,
-                        "amount_staked": int(amount * 1e9),
-                    },
-                )
-            else:
-                call = await sub.substrate.compose_call(
-                    call_module="SubtensorModule",
-                    call_function="remove_stake",
-                    call_params={
-                        "hotkey": coldkey_ss58,
-                        "netuid": netuid,
-                        "amount_unstaked": int(amount * 1e9),
-                    },
-                )
+            amount_param = (
+                "amount_staked" if operation == "add_stake" else "amount_unstaked"
+            )
+            call = await sub.compose_call(
+                call_module="SubtensorModule",
+                call_function=operation,
+                call_params={
+                    # hotkey field expects an SS58; for fee simulation the
+                    # specific value doesn't change the weight/length fee.
+                    "hotkey": coldkey_ss58,
+                    "netuid": netuid,
+                    amount_param: int(amount * 1e9),
+                },
+            )
 
             if uses_proxy:
-                call = await sub.substrate.compose_call(
+                call = await sub.compose_call(
                     call_module="Proxy",
                     call_function="proxy",
                     call_params={
@@ -468,27 +479,33 @@ class BittensorFeeClient:
                 )
 
             keypair = bt.Keypair(ss58_address=coldkey_ss58)
-            info = await sub.substrate.get_payment_info(
-                call=call, keypair=keypair,
-            )
-            partial_fee_rao = int(info.get("partial_fee", info.get("partialFee", 0)))
-            return {"partial_fee_tao": partial_fee_rao / 1e9}
+            fee = await sub.get_extrinsic_fee(call=call, keypair=keypair)
+            return {"partial_fee_tao": _balance_to_tao(fee) or 0.0}
         finally:
             try:
                 await sub.close()
             except Exception:
                 pass
 
-    @staticmethod
-    def _balance_to_tao(b) -> Optional[float]:
-        """Convert a bittensor Balance (or None) to a plain TAO float."""
-        if b is None:
-            return None
-        if hasattr(b, "tao"):
-            return float(b.tao)
-        if hasattr(b, "rao"):
-            return float(b.rao) / 1e9
+
+def _balance_to_tao(b) -> Optional[float]:
+    """Convert a bittensor ``Balance`` (or None / int-rao / float-tao) to a
+    plain TAO float. Module-level so both BittensorFeeClient and tests
+    can use it.
+    """
+    if b is None:
+        return None
+    if hasattr(b, "tao"):
         try:
-            return float(b)
-        except (TypeError, ValueError):
-            return None
+            return float(b.tao)
+        except Exception:
+            pass
+    if hasattr(b, "rao"):
+        try:
+            return float(b.rao) / 1e9
+        except Exception:
+            pass
+    try:
+        return float(b)
+    except (TypeError, ValueError):
+        return None

@@ -95,9 +95,26 @@ def _jsonable(v: Any) -> Any:
 
 
 def _extract_tx_hash(result: Any) -> str | None:
-    """Try common attribute names for the extrinsic hash."""
-    if result is None:
+    """Try known attribute paths for the extrinsic hash.
+
+    Primary: ``result.extrinsic_receipt.extrinsic_hash`` —
+    the bittensor SDK ``ExtrinsicResponse`` exposes the tx hash through
+    its ``extrinsic_receipt`` field (see
+    bittensor/core/types.py::ExtrinsicResponse).
+
+    Fallbacks: direct ``extrinsic_hash`` / ``tx_hash`` / ``hash``
+    attributes or dict keys. Raw ``result = True`` (legacy pattern)
+    returns None.
+    """
+    if result is None or result is True or result is False:
         return None
+
+    receipt = getattr(result, "extrinsic_receipt", None)
+    if receipt is not None:
+        h = getattr(receipt, "extrinsic_hash", None)
+        if h:
+            return str(h)
+
     for attr in ("extrinsic_hash", "extrinsic_hash_hex", "tx_hash",
                  "hash", "block_hash"):
         v = getattr(result, attr, None)
@@ -111,12 +128,25 @@ def _extract_tx_hash(result: Any) -> str | None:
 
 
 def _extract_partial_fee_tao(result: Any) -> float | None:
-    """Extract partial_fee (rao) and convert to TAO.
+    """Extract the transaction (extrinsic) fee in TAO.
 
-    Looks in common attribute / key names. Returns None if not present.
+    Primary: ``result.extrinsic_fee`` — a ``Balance`` on the bittensor
+    SDK ``ExtrinsicResponse``. Source:
+    bittensor/core/types.py::ExtrinsicResponse.extrinsic_fee.
+
+    Fallbacks: raw substrate responses (``{"partial_fee": int}``),
+    older SDK shapes with ``partial_fee`` / ``fee_info`` / ``fee``
+    attributes. Returns None when no fee can be extracted.
     """
-    if result is None:
+    if result is None or result is True or result is False:
         return None
+
+    # bittensor SDK ExtrinsicResponse — primary path.
+    v = getattr(result, "extrinsic_fee", None)
+    if v is not None:
+        return _as_fee_tao(v)
+
+    # Lower-level / raw substrate response.
     candidates = ("partial_fee", "partialFee", "fee_info", "fee")
     for attr in candidates:
         v = getattr(result, attr, None)
@@ -129,10 +159,44 @@ def _extract_partial_fee_tao(result: Any) -> float | None:
     return None
 
 
+def _extract_swap_fee_tao(result: Any) -> float | None:
+    """Extract the swap (liquidity) fee in TAO from the extrinsic result.
+
+    Populated by the bittensor SDK as:
+        transaction_tao_fee: Balance (for add_stake / buys)
+        transaction_alpha_fee: Balance (for remove_stake / sells)
+
+    Source: bittensor/core/types.py::ExtrinsicResponse. Returns the
+    tao-denominated amount; alpha fees are returned as-is (caller
+    knows the side and can convert using pool spot price).
+    """
+    if result is None or result is True or result is False:
+        return None
+    v = getattr(result, "transaction_tao_fee", None)
+    if v is not None:
+        return _as_fee_tao(v)
+    if isinstance(result, dict) and result.get("transaction_tao_fee") is not None:
+        return _as_fee_tao(result["transaction_tao_fee"])
+    return None
+
+
+def _extract_swap_fee_alpha(result: Any) -> float | None:
+    """Extract the alpha-denominated swap fee (remove_stake)."""
+    if result is None or result is True or result is False:
+        return None
+    v = getattr(result, "transaction_alpha_fee", None)
+    if v is not None:
+        return _as_fee_alpha(v)
+    if isinstance(result, dict) and result.get("transaction_alpha_fee") is not None:
+        return _as_fee_alpha(result["transaction_alpha_fee"])
+    return None
+
+
 def _as_fee_tao(v: Any) -> float | None:
-    """Coerce a rao int / Balance / dict into TAO float."""
+    """Coerce a Balance / rao-int / dict into TAO float."""
     if v is None:
         return None
+    # Balance with .tao attr — prefer this path (SDK standard).
     if hasattr(v, "tao"):
         try:
             return float(v.tao)
@@ -144,20 +208,43 @@ def _as_fee_tao(v: Any) -> float | None:
         except Exception:
             pass
     if isinstance(v, dict):
-        for k in ("partial_fee", "partialFee", "tao", "rao"):
-            if k in v:
-                x = v[k]
-                if k in ("partial_fee", "partialFee", "rao"):
-                    try:
-                        return float(x) / 1e9
-                    except Exception:
-                        return None
+        for k in ("partial_fee", "partialFee", "rao"):
+            if k in v and v[k] is not None:
                 try:
-                    return float(x)
+                    return float(v[k]) / 1e9
+                except Exception:
+                    return None
+        for k in ("tao",):
+            if k in v and v[k] is not None:
+                try:
+                    return float(v[k])
                 except Exception:
                     return None
     try:
-        # Assume rao if it's a raw int > 1000 (TAO values are rarely that big)
+        # Raw int/float fallback: heuristic — values > 1000 are likely rao.
+        n = float(v)
+        return n / 1e9 if n > 1000 else n
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_fee_alpha(v: Any) -> float | None:
+    """Coerce a Balance / rao-int into alpha tokens."""
+    if v is None:
+        return None
+    if hasattr(v, "tao"):
+        # Balance objects represent alpha in the same .tao/.rao numeric
+        # fields; .tao on an alpha Balance is alpha-tokens-normalized.
+        try:
+            return float(v.tao)
+        except Exception:
+            pass
+    if hasattr(v, "rao"):
+        try:
+            return float(v.rao) / 1e9
+        except Exception:
+            pass
+    try:
         n = float(v)
         return n / 1e9 if n > 1000 else n
     except (TypeError, ValueError):
@@ -751,6 +838,25 @@ class TradeExecutor:
             except Exception as e:
                 parse_error = (parse_error + "|" if parse_error else "") + \
                     f"gas_fee:{type(e).__name__}:{e}"
+
+            try:
+                if trade_type == "buy":
+                    # add_stake: swap fee denominated in TAO directly.
+                    observed_swap_tao = _extract_swap_fee_tao(raw_result)
+                else:
+                    # remove_stake: chain returns alpha fee. Convert to TAO
+                    # using the post-trade pool state (more accurate) or
+                    # pre-trade (fallback). Downstream calibration tooling
+                    # can reconvert from raw if needed.
+                    alpha_fee = _extract_swap_fee_alpha(raw_result)
+                    if alpha_fee is not None and alpha_fee > 0:
+                        pool_tao_ref = pool_tao_post or pool_tao_at_submit
+                        pool_alpha_ref = pool_alpha_post or pool_alpha_at_submit
+                        if pool_tao_ref and pool_alpha_ref and pool_alpha_ref > 0:
+                            observed_swap_tao = alpha_fee * (pool_tao_ref / pool_alpha_ref)
+            except Exception as e:
+                parse_error = (parse_error + "|" if parse_error else "") + \
+                    f"swap_fee:{type(e).__name__}:{e}"
 
             record = {
                 "wallet_coldkey": coldkey_ss58,
