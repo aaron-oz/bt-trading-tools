@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bt_trading_tools.amm import amm_buy, amm_sell, slippage_pct, spot_price
 from bt_trading_tools.backtest.stats import BacktestStats, compute_stats
 from bt_trading_tools.backtest.types import Order, Position, Strategy, SubnetTick, TickData
+
+if TYPE_CHECKING:
+    from bt_trading_tools.alpha_yield import AlphaYieldModel
+    from bt_trading_tools.fees import FeeModel
 
 
 @dataclass
@@ -72,7 +76,26 @@ class BacktestEngine:
         trade_log: Any = None,
         portfolio_log: Any = None,
         ticks_per_year: float = 365.0,
+        fee_model: FeeModel | None = None,
+        yield_model: AlphaYieldModel | None = None,
     ):
+        """
+        Extra kwargs (back-compat preserved when both are None):
+
+            fee_model:  When provided, replaces the flat
+                ``swap_fee_rate + gas_fee_tao`` formula with a deterministic
+                per-trade FeeModel.quote(...) call. Trade records gain
+                ``swap_fee_tao`` / ``gas_fee_tao`` / ``proxy_fee_tao`` /
+                ``fee_source`` fields.
+            yield_model: When provided, applies alpha yield accretion to
+                sells (``effective_alpha_qty``) and to MTM equity. Pure,
+                idempotent; backtest-time simulated timestamps are used
+                as ``now`` so reruns are deterministic. Trade records
+                (sells) gain ``alpha_yield_accrued``.
+
+        When both are ``None``, behavior is identical to pre-integration —
+        every existing backtest runs unchanged.
+        """
         self.starting_capital = capital
         self.bot_name = bot_name
         self.swap_fee_rate = swap_fee_rate
@@ -82,6 +105,8 @@ class BacktestEngine:
         self.trade_log = trade_log
         self.portfolio_log = portfolio_log
         self.ticks_per_year = ticks_per_year
+        self.fee_model = fee_model
+        self.yield_model = yield_model
 
     def run(
         self,
@@ -186,16 +211,21 @@ class BacktestEngine:
             for netuid in list(positions.keys()):
                 pos = positions[netuid]
                 st = last_tick.subnets.get(netuid)
+                accrued = self._accrued_yield(netuid, pos, last_tick.timestamp)
+                effective_alpha_qty = pos.alpha_qty + accrued
                 if st and st.tao_pool > 0 and st.alpha_pool > 0:
                     tao_out, _, _ = amm_sell(
-                        pos.alpha_qty, st.tao_pool, st.alpha_pool,
+                        effective_alpha_qty, st.tao_pool, st.alpha_pool,
                     )
-                    fee = tao_out * self.swap_fee_rate + self.gas_fee_tao
+                    fee, fee_components = self._sell_fee(
+                        netuid, effective_alpha_qty, st.tao_pool, st.alpha_pool,
+                    )
                     tao_received = tao_out - fee
                 else:
                     price = st.price if st else pos.entry_price
-                    tao_received = pos.alpha_qty * price
+                    tao_received = effective_alpha_qty * price
                     fee = 0.0
+                    fee_components = {}
 
                 pnl = tao_received - pos.tao_cost
                 capital += tao_received
@@ -205,14 +235,19 @@ class BacktestEngine:
                     "entry_time": pos.entry_time,
                     "exit_time": last_tick.timestamp,
                     "entry_price": pos.entry_price,
-                    "exit_price": tao_received / pos.alpha_qty if pos.alpha_qty > 0 else 0,
-                    "alpha_qty": pos.alpha_qty,
+                    "exit_price": (
+                        tao_received / effective_alpha_qty
+                        if effective_alpha_qty > 0 else 0
+                    ),
+                    "alpha_qty": effective_alpha_qty,
                     "tao_cost": pos.tao_cost,
                     "tao_received": tao_received,
                     "pnl": pnl,
                     "fees": pos.entry_fees + fee,
                     "hold_seconds": last_tick.timestamp - pos.entry_time,
                     "reason": "end_of_data",
+                    "alpha_yield_accrued": accrued,
+                    **fee_components,
                 }
                 trades.append(trade)
                 self._record_trade(trade, "sell")
@@ -277,7 +312,9 @@ class BacktestEngine:
             return None
 
         # AMM execution with fees
-        fee = spend * self.swap_fee_rate + self.gas_fee_tao
+        fee, fee_components = self._buy_fee(
+            order.netuid, spend, st.tao_pool, st.alpha_pool,
+        )
         spend_net = spend - fee
         if spend_net <= 0:
             return None
@@ -323,6 +360,7 @@ class BacktestEngine:
             "fees": fee,
             "hold_seconds": 0,
             "reason": order.reason,
+            **fee_components,
         }
         self._record_trade(trade, "buy")
 
@@ -342,12 +380,30 @@ class BacktestEngine:
         if pos is None:
             return None
 
-        alpha_to_sell = order.alpha_amount if order.alpha_amount > 0 else pos.alpha_qty
+        # Apply yield accretion — effective_alpha_qty is what would actually
+        # be on-chain at tick.timestamp. Pure function; no state mutation.
+        # "Sell all" (alpha_amount<=0) consumes the entire effective position
+        # and realizes all accrued yield. A partial sell (explicit
+        # alpha_amount>0) draws only from the state-tracked pos.alpha_qty —
+        # yield is realized only on position close. This keeps state simple
+        # and matches how paper bots operate (single sell per position).
+        accrued = self._accrued_yield(order.netuid, pos, tick.timestamp)
+        is_close = order.alpha_amount <= 0
+        if is_close:
+            alpha_to_sell = pos.alpha_qty + accrued
+            yield_realized = accrued
+        else:
+            alpha_to_sell = order.alpha_amount
+            yield_realized = 0.0
 
         # Cap at max pool percentage (in alpha equivalent)
         if st.alpha_pool > 0:
             max_alpha_by_pool = st.alpha_pool * self.max_pool_pct
-            alpha_to_sell = min(alpha_to_sell, max_alpha_by_pool)
+            if alpha_to_sell > max_alpha_by_pool:
+                # Partial execution truncates yield realization too
+                if is_close and alpha_to_sell > 0:
+                    yield_realized = yield_realized * (max_alpha_by_pool / alpha_to_sell)
+                alpha_to_sell = max_alpha_by_pool
 
         if alpha_to_sell <= 0:
             return None
@@ -371,16 +427,27 @@ class BacktestEngine:
         # AMM execution
         if use_pool_tao > 0 and use_pool_alpha > 0:
             tao_out, _, _ = amm_sell(alpha_to_sell, use_pool_tao, use_pool_alpha)
-            fee = tao_out * self.swap_fee_rate + self.gas_fee_tao
+            fee, fee_components = self._sell_fee(
+                order.netuid, alpha_to_sell,
+                use_pool_tao, use_pool_alpha,
+            )
             tao_received = max(0, tao_out - fee)
         else:
             tao_received = alpha_to_sell * st.price
             fee = 0.0
+            fee_components = {}
 
-        # Proportional cost basis
-        fraction = alpha_to_sell / pos.alpha_qty if pos.alpha_qty > 0 else 1.0
-        fraction = min(fraction, 1.0)
-        cost_of_sold = pos.tao_cost * fraction
+        # Proportional cost basis — yield alpha has zero cost basis
+        # (matches pnl.py semantics). For a full close, cost_of_sold is the
+        # entire pos.tao_cost; for a partial sell, proportional to
+        # alpha_to_sell / pos.alpha_qty.
+        if is_close:
+            cost_of_sold = pos.tao_cost
+            fraction = 1.0
+        else:
+            fraction = alpha_to_sell / pos.alpha_qty if pos.alpha_qty > 0 else 1.0
+            fraction = min(fraction, 1.0)
+            cost_of_sold = pos.tao_cost * fraction
         pnl = tao_received - cost_of_sold
 
         trade = {
@@ -396,22 +463,84 @@ class BacktestEngine:
             "fees": pos.entry_fees * fraction + fee,
             "hold_seconds": tick.timestamp - pos.entry_time,
             "reason": order.reason,
+            "alpha_yield_accrued": yield_realized,
+            **fee_components,
         }
         trades.append(trade)
         self._record_trade(trade, "sell")
 
-        # Update or remove position
-        remaining = pos.alpha_qty - alpha_to_sell
-        if remaining < 1e-9:
+        # Update or remove position. State tracks only bought alpha;
+        # accrued yield is off-state (pure function of entry_time + now).
+        if is_close:
             del positions[order.netuid]
         else:
-            pos.alpha_qty = remaining
+            pos.alpha_qty -= alpha_to_sell
             pos.tao_cost -= cost_of_sold
             pos.entry_fees -= pos.entry_fees * fraction
+            if pos.alpha_qty < 1e-9:
+                del positions[order.netuid]
 
         return capital + tao_received
 
     # ── Helpers ──────────────────────────────────────────────────
+
+    # ── Fee + yield helpers (opt-in via fee_model / yield_model) ─────
+
+    def _buy_fee(
+        self, netuid: int, spend: float,
+        pool_tao: float, pool_alpha: float,
+    ) -> tuple[float, dict]:
+        """Return (total_fee, extra_trade_fields)."""
+        if self.fee_model is None:
+            fee = spend * self.swap_fee_rate + self.gas_fee_tao
+            return fee, {}
+        spot = pool_tao / pool_alpha if pool_alpha > 0 else None
+        q = self.fee_model.quote(
+            "add_stake", netuid=netuid, amount=spend,
+            uses_proxy=True, spot_price=spot,
+        )
+        return q.total_fee_tao, {
+            "swap_fee_tao": q.swap_fee_tao,
+            "gas_fee_tao": q.gas_fee_tao,
+            "proxy_fee_tao": q.proxy_fee_tao,
+            "fee_source": q.source.value,
+        }
+
+    def _sell_fee(
+        self, netuid: int, alpha_qty: float,
+        pool_tao: float, pool_alpha: float,
+    ) -> tuple[float, dict]:
+        """Return (total_fee, extra_trade_fields)."""
+        if self.fee_model is None:
+            # Historical engine computed fee from tao_out, not alpha_qty.
+            # Reproduce that path exactly for back-compat.
+            tao_out, _, _ = amm_sell(alpha_qty, pool_tao, pool_alpha)
+            fee = tao_out * self.swap_fee_rate + self.gas_fee_tao
+            return fee, {}
+        spot = pool_tao / pool_alpha if pool_alpha > 0 else None
+        q = self.fee_model.quote(
+            "remove_stake", netuid=netuid, amount=alpha_qty,
+            uses_proxy=True, spot_price=spot,
+        )
+        return q.total_fee_tao, {
+            "swap_fee_tao": q.swap_fee_tao,
+            "gas_fee_tao": q.gas_fee_tao,
+            "proxy_fee_tao": q.proxy_fee_tao,
+            "fee_source": q.source.value,
+        }
+
+    def _accrued_yield(
+        self, netuid: int, pos: Position, now_ts: float,
+    ) -> float:
+        """Pure accrued-yield lookup. Returns 0.0 when no yield model."""
+        if self.yield_model is None:
+            return 0.0
+        return self.yield_model.accrued_yield(
+            netuid=netuid,
+            alpha_qty=pos.alpha_qty,
+            entry_time=pos.entry_time,
+            now=now_ts,
+        )
 
     def _portfolio_value(
         self,
@@ -419,13 +548,15 @@ class BacktestEngine:
         positions: dict[int, Position],
         tick: TickData,
     ) -> float:
-        """Mark-to-market portfolio value."""
+        """Mark-to-market portfolio value (accounts for accrued yield)."""
         value = capital
         for netuid, pos in positions.items():
             st = tick.subnets.get(netuid)
             if st:
+                accrued = self._accrued_yield(netuid, pos, tick.timestamp)
+                effective_alpha = pos.alpha_qty + accrued
                 # Cap MTM at 10x cost to handle price anomalies
-                mtm = min(pos.alpha_qty * st.price, pos.tao_cost * 10)
+                mtm = min(effective_alpha * st.price, pos.tao_cost * 10)
                 value += mtm
             else:
                 value += pos.tao_cost  # fallback: assume flat
