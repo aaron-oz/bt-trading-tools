@@ -204,6 +204,7 @@ class FeeModel:
         if self._chain is None:
             q = self._fallback_quote(
                 operation, netuid, amount, uses_proxy, now,
+                spot_price=spot_price,
                 error="no_chain_client",
             )
         else:
@@ -219,6 +220,7 @@ class FeeModel:
                 )
                 q = self._fallback_quote(
                     operation, netuid, amount, uses_proxy, now,
+                    spot_price=spot_price,
                     error=f"{type(e).__name__}: {e}",
                 )
 
@@ -307,27 +309,34 @@ class FeeModel:
         amount: float,
         uses_proxy: bool,
         now: float,
+        spot_price: Optional[float] = None,
         error: Optional[str] = None,
     ) -> FeeQuote:
         """Compute a fallback quote from calibrated constants.
 
-        Swap fee is ``amount × fallback_swap_rate``. For remove_stake this
-        is alpha × rate (in alpha); we treat the rate as dimensionless and
-        return ``amount × rate`` — callers should be aware this under-
-        estimates by the TAO/alpha conversion factor when amount is
-        alpha-denominated. The paper-trader agent's pipeline always passes
-        TAO-denominated amounts on buys and alpha-denominated on sells, and
-        downstream consumers treat the number as "fee in the unit of
-        amount"; post-TAO-normalization in the caller is the caller's job
-        in fallback mode. In practice: fallback is only hit when the chain
-        is unreachable and the caller should already have the spot price
-        for its own AMM math.
+        add_stake: ``amount`` is TAO, swap fee = amount × fallback_swap_rate
+        (already TAO-denominated).
 
-        To keep this simple and honest: fallback produces numerically the
-        same shape it always produced (the historical constants × amount).
-        Calibration will refit after real data lands.
+        remove_stake: ``amount`` is alpha. The chain-truth swap fee is
+        ``alpha × fallback_swap_rate`` in alpha units. To express it as
+        ``swap_fee_tao`` consistently with the chain-quote path, convert
+        via ``spot_price`` (TAO per alpha). If ``spot_price`` is missing
+        on a remove_stake fallback, we refuse to make up a number —
+        return a fallback with ``swap_fee_tao=0`` and an error tag so the
+        caller knows the dimension couldn't be resolved.
         """
-        swap_fee_tao = amount * self._fallback_swap_rate
+        if operation == "add_stake":
+            swap_fee_tao = amount * self._fallback_swap_rate
+            err_out = error
+        else:
+            if spot_price is None or spot_price <= 0:
+                swap_fee_tao = 0.0
+                err_out = (error + "|" if error else "") + \
+                    "remove_stake_fallback_no_spot_price"
+            else:
+                swap_fee_alpha = amount * self._fallback_swap_rate
+                swap_fee_tao = swap_fee_alpha * float(spot_price)
+                err_out = error
         gas_fee_tao = self._fallback_gas_tao
         proxy_fee_tao = self._fallback_proxy_tao if uses_proxy else 0.0
         total = swap_fee_tao + gas_fee_tao + proxy_fee_tao
@@ -342,7 +351,7 @@ class FeeModel:
             total_fee_tao=total,
             source=FeeSource.FALLBACK,
             observed_at=now,
-            error=error,
+            error=err_out,
         )
 
 
