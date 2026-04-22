@@ -131,16 +131,18 @@ Yield is realized **only at sell** — never continuously mutating position stat
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `chain_tx_hash` | `str` \| `null` | yes | Chain transaction hash for live trades. Null for paper. |
-| `wallet_coldkey` | `str` (SS58) \| `null` | yes | The bot's proxy coldkey SS58 (signer). Null for paper. |
-| `wallet_hotkey` | `str` (SS58) \| `null` | yes | The bot's proxy-wallet hotkey SS58 (from the bittensor `Wallet` object tied to the coldkey above). Null for paper. |
+| `wallet_coldkey` | `str` (SS58) \| `null` | yes | The bot's **ledger coldkey** SS58 — the real account that holds TAO. Under substrate proxy semantics, calls signed by a proxy execute *as the real account*, so this is what the chain records for the staking operation. Null for paper. |
+| `wallet_hotkey` | `str` (SS58) \| `null` | yes | The bot's hotkey SS58, paired with the ledger coldkey in a bittensor `Wallet`. Null for paper. |
 | `validator_hotkey` | `str` (SS58) \| `null` | yes | The validator hotkey this stake was delegated to (destination). Null for paper or when not applicable. |
 
 Rationale for three identity fields:
-- `wallet_coldkey` is the **signer** — the proxy coldkey that authorized the extrinsic.
-- `wallet_hotkey` is the **bot's own** wallet hotkey (paired with the coldkey in a bittensor `Wallet`). Not the same as the validator hotkey.
+- `wallet_coldkey` is the **bot's ledger coldkey** — the real account recorded on-chain as the source of the stake. NOT the proxy coldkey. The executor's `_coldkey_for_receipt` correctly returns `proxy_manager.real_account_ss58` when a proxy is active, because that's what chain attribution sees.
+- `wallet_hotkey` is the **bot's own** wallet hotkey (paired with the ledger coldkey). Not the same as the validator hotkey.
 - `validator_hotkey` is the **delegation destination** — the validator the stake was delegated to. A separate selection per trade.
 
 Chain audit data (which sees coldkey, validator hotkey, netuid, amount — but no `bot_id`) can join back via `(wallet_coldkey, netuid, timestamp)` or `(validator_hotkey, netuid, timestamp)`.
+
+**Note on architecture:** the fleet uses one ledger coldkey per bot (HD-derived from a single seed), each with one delegated proxy coldkey for staking-only signatures. Because proxy semantics route on-chain attribution to the real (ledger) account, `wallet_coldkey` in the trade log is always the bot's ledger coldkey, never the proxy. Each bot has exactly one `(wallet_coldkey, wallet_hotkey)` identity on chain.
 
 ### 4.6 `category` enum
 

@@ -23,7 +23,15 @@ from bt_trading_tools.backtest.types import (
     SubnetTick,
     Strategy,
 )
-from bt_trading_tools.backtest.stats import compute_stats
+from bt_trading_tools.backtest.stats import (
+    compute_stats,
+    compute_regime_stats,
+    validate_cv_results,
+    BacktestStats,
+    RegimeStats,
+    ValidationCheck,
+    ValidationReport,
+)
 from bt_trading_tools.backtest.cv import PurgedWalkForwardCV, CVFold
 from bt_trading_tools.backtest.scheduled import ScheduledStrategy
 
@@ -35,7 +43,13 @@ __all__ = [
     "TickData",
     "SubnetTick",
     "Strategy",
+    "BacktestStats",
     "compute_stats",
+    "compute_regime_stats",
+    "validate_cv_results",
+    "RegimeStats",
+    "ValidationCheck",
+    "ValidationReport",
     "PurgedWalkForwardCV",
     "CVFold",
     "ScheduledStrategy",

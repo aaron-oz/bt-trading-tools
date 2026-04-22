@@ -251,7 +251,44 @@ class UnifiedDataLoader:
         sh["netuid"] = sh["netuid"].astype(int)
         sh["emission"] = sh["emission"].fillna(0).astype(float)
         sh["tempo"] = sh["tempo"].fillna(360).astype(float).clip(lower=1)
-        sh["daily_emission_tao"] = sh["emission"] * (7200.0 / sh["tempo"]) / 1e9
+
+        # TAO/day injection per subnet.
+        #
+        # The `emission` column stores `SubtensorModule::SubnetTaoInEmission`, which is
+        # rao *per block* at the Taostats-snapshot block — NOT rao per tempo. The
+        # tempo field is irrelevant to this conversion. An earlier implementation
+        # of this formula (`emission × 7200/tempo / 1e9`) was low by a factor of
+        # ~tempo (~360× for typical subnets). Corrected on 2026-04-20.
+        #
+        # Preferred form uses the dimensionless `projected_emission` (Taoflow
+        # share) column, which at daily granularity is stable and mathematically
+        # sums to 1.0 across active subnets. At a per-block snapshot, the raw
+        # `emission` column is extremely noisy — ~50% of subnets show 0 on any
+        # given sampled block.
+        #
+        # Halving-aware block reward: 1.0 TAO/block pre-halving, 0.5 TAO/block
+        # after the first halving (2025-12-14, per the mechanics primer §5).
+        #
+        # Empirical verification: `sum(projected_emission × 0.5 × 7200)` across
+        # active subnets lands within 0.3% of 3,600 TAO/day on every post-halving
+        # date tested (2026-03-05 through 2026-04-19). See
+        # `docs/emission_premium_correction_report.md` for the full audit.
+        HALVING_DATE = pd.Timestamp("2025-12-14")
+        block_reward = sh["timestamp"].apply(
+            lambda t: 0.5 if t >= HALVING_DATE else 1.0
+        )
+        if "projected_emission" in sh.columns:
+            sh["projected_emission"] = (
+                sh["projected_emission"].fillna(0).astype(float)
+            )
+            sh["daily_emission_tao"] = (
+                sh["projected_emission"] * block_reward * 7200.0
+            )
+        else:
+            # Fallback: per-block raw emission × blocks/day. Correct in
+            # expectation but noisy at single-block granularity. Use
+            # `projected_emission` when available.
+            sh["daily_emission_tao"] = sh["emission"] * 7200.0 / 1e9
 
         return ohlcv, pool, sh
 

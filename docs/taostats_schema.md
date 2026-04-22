@@ -123,8 +123,8 @@ Daily subnet configuration and emission data. One row per subnet per day.
 | `netuid` | int | — | Subnet network UID |
 | `block_number` | int | — | Block number of snapshot |
 | `timestamp` | datetime | UTC ISO8601 | Snapshot timestamp |
-| `emission` | float | **rao** | Per-tempo emission (divide by 1e9 for TAO) |
-| `projected_emission` | float | rao | Projected emission |
+| `emission` | float | **rao per block** | Per-block TAO emission snapshot (`SubtensorModule::SubnetTaoInEmission` at the Taostats snapshot block). NOT per-tempo. Tempo is irrelevant to daily conversion. See the "Gotcha" note below. |
+| `projected_emission` | float | fraction (dimensionless) | Taoflow share at the snapshot; sums to ~1.0 across active subnets. Preferred input for daily-rate calculations (see loader Key Derived Fields). |
 | `ema_tao_flow` | float | rao | Exponential moving average of TAO flow |
 | `tao_flow` | float | rao | Raw TAO flow |
 | `excess_tao` | float | rao | Excess TAO in subnet |
@@ -151,7 +151,23 @@ Daily subnet configuration and emission data. One row per subnet per day.
 
 **Source:** `api/subnet/history/v1`
 
-**Gotcha:** The loader derives `daily_emission_tao = emission * (7200 / tempo) / 1e9`. The raw `emission` field is per-tempo in rao; the derived field normalizes to daily TAO.
+**Gotcha (corrected 2026-04-20):** the loader derives `daily_emission_tao`. An earlier version of this formula divided by `tempo` — that was wrong. The `emission` field is rao per *block*, not per *tempo*; dividing by tempo undercounted daily injection by exactly that factor (~360× for typical subnets).
+
+Preferred formula, used by `UnifiedDataLoader` when `projected_emission` is available:
+
+```
+daily_emission_tao = projected_emission × block_reward(t) × 7200
+```
+
+where `block_reward(t) = 1.0` TAO/block pre-halving (before 2025-12-14) and `0.5` post-halving, and `7200` is blocks/day (12 s block time).
+
+Fallback formula when `projected_emission` is missing, used for older data:
+
+```
+daily_emission_tao = emission × 7200 / 1e9
+```
+
+The fallback is correct in expectation but noisy at single-block granularity (~50% of subnets show `emission = 0` on any given snapshot block). See `docs/bittensor-mechanics-primer.md` §5 for the full derivation and the loader source `bt_trading_tools/data/loader.py` for implementation.
 
 ---
 
@@ -198,7 +214,7 @@ The loader (`bt_trading_tools/data/loader.py`) reads CSVs and produces aligned `
 | `k` | `tao_in * alpha_in` | AMM constant product invariant |
 | `tao_pools` | `sqrt(k * price)` | Derived from k and spot price |
 | `alpha_pools` | `sqrt(k / price)` | Derived from k and spot price |
-| `daily_emission_tao` | `emission * (7200 / tempo) / 1e9` | Normalized daily emission |
+| `daily_emission_tao` | `projected_emission × block_reward(t) × 7200` (preferred) or `emission × 7200 / 1e9` (fallback) | Daily TAO injected into the pool. Corrected 2026-04-20 — see subnet_history "Gotcha" above |
 
 ### Optional Data Sources
 
