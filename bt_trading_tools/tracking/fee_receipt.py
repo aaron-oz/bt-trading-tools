@@ -32,7 +32,7 @@ from typing import Any, Iterator, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 
-FEE_RECEIPT_SCHEMA_VERSION = 1
+FEE_RECEIPT_SCHEMA_VERSION = 2
 
 _log = logging.getLogger(__name__)
 _STOP_SENTINEL = object()
@@ -72,6 +72,17 @@ class FeeReceipt(BaseModel):
     pool_alpha_post: Optional[float] = Field(default=None, ge=0)
     raw_extrinsic_result: Optional[dict] = None
     parse_error: Optional[str] = None
+
+    # v2 fields (2026-04-23): block-level anchors for forensic audit.
+    # Lets scripts/verify_fees.py (and CQI §4.1 runtime-upgrade tripwire)
+    # pin receipts to a specific block-height/hash rather than wall-clock
+    # time alone. extrinsic_index is deferred — the SDK exposes it only
+    # behind a private attribute on a property that may trigger an extra
+    # RPC; schema carries the field, parser populates when native exposure
+    # lands (see F2 in fleet review pipeline).
+    block_hash: Optional[str] = None
+    block_number: Optional[int] = Field(default=None, ge=0)
+    extrinsic_index: Optional[int] = Field(default=None, ge=0)
 
 
 _receipt_adapter = TypeAdapter(FeeReceipt)

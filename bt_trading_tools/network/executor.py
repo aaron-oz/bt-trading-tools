@@ -127,6 +127,66 @@ def _extract_tx_hash(result: Any) -> str | None:
     return None
 
 
+def _extract_block_hash(result: Any) -> str | None:
+    """Try known attribute paths for the block hash of the included extrinsic.
+
+    Primary: ``result.extrinsic_receipt.block_hash`` — the SDK
+    ``ExtrinsicResponse.extrinsic_receipt`` is an ``ExtrinsicReceipt``
+    instance with ``block_hash`` as a public attribute (see
+    async_substrate_interface/sync_substrate.py::ExtrinsicReceipt). Safe
+    direct access — no RPC is triggered.
+
+    Returns None when receipt is absent (e.g., timeout) or attribute
+    missing.
+    """
+    if result is None or result is True or result is False:
+        return None
+    receipt = getattr(result, "extrinsic_receipt", None)
+    if receipt is not None:
+        v = getattr(receipt, "block_hash", None)
+        if v:
+            return str(v)
+    # Rare legacy shape: raw dict with direct block_hash.
+    if isinstance(result, dict):
+        v = result.get("block_hash")
+        if v:
+            return str(v)
+    return None
+
+
+def _extract_block_number(result: Any) -> int | None:
+    """Try known attribute paths for the block number.
+
+    Primary: ``result.extrinsic_receipt.block_number`` — public int
+    attribute on ``ExtrinsicReceipt``. Safe direct access.
+
+    Returns None when receipt is absent or attribute unpopulated
+    (receipt constructor accepts it as Optional[int]).
+    """
+    if result is None or result is True or result is False:
+        return None
+    receipt = getattr(result, "extrinsic_receipt", None)
+    if receipt is not None:
+        v = getattr(receipt, "block_number", None)
+        if v is not None:
+            try:
+                n = int(v)
+                if n >= 0:
+                    return n
+            except (TypeError, ValueError):
+                return None
+    if isinstance(result, dict):
+        v = result.get("block_number")
+        if v is not None:
+            try:
+                n = int(v)
+                if n >= 0:
+                    return n
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _extract_partial_fee_tao(result: Any) -> float | None:
     """Extract the transaction (extrinsic) fee in TAO.
 
@@ -821,6 +881,8 @@ class TradeExecutor:
             observed_swap_tao: float | None = None
             observed_proxy_tao: float | None = None
             raw_dump: dict | None = None
+            block_hash: str | None = None
+            block_number: int | None = None
 
             try:
                 raw_dump = _safe_raw_dump(raw_result)
@@ -832,6 +894,18 @@ class TradeExecutor:
             except Exception as e:
                 parse_error = (parse_error + "|" if parse_error else "") + \
                     f"tx_hash:{type(e).__name__}:{e}"
+
+            try:
+                block_hash = _extract_block_hash(raw_result)
+            except Exception as e:
+                parse_error = (parse_error + "|" if parse_error else "") + \
+                    f"block_hash:{type(e).__name__}:{e}"
+
+            try:
+                block_number = _extract_block_number(raw_result)
+            except Exception as e:
+                parse_error = (parse_error + "|" if parse_error else "") + \
+                    f"block_number:{type(e).__name__}:{e}"
 
             try:
                 observed_gas_tao = _extract_partial_fee_tao(raw_result)
@@ -877,6 +951,12 @@ class TradeExecutor:
                 "pool_alpha_post": pool_alpha_post,
                 "raw_extrinsic_result": raw_dump,
                 "parse_error": parse_error,
+                # v2 fields (2026-04-23). extrinsic_index left None —
+                # the SDK exposes it only via a property that may trigger
+                # an extra RPC; follow-up in Gate H F2.
+                "block_hash": block_hash,
+                "block_number": block_number,
+                "extrinsic_index": None,
             }
             self._fee_writer.log_receipt(record)
         except Exception as e:

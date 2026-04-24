@@ -30,6 +30,8 @@ from bt_trading_tools.network.executor import (
     _as_fee_alpha,
     _as_fee_tao,
     _coldkey_for_receipt,
+    _extract_block_hash,
+    _extract_block_number,
     _extract_partial_fee_tao,
     _extract_swap_fee_alpha,
     _extract_swap_fee_tao,
@@ -56,8 +58,15 @@ class _FakeBalance:
 
 class _FakeReceipt:
     """Mimics async_substrate_interface.AsyncExtrinsicReceipt."""
-    def __init__(self, extrinsic_hash: str):
+    def __init__(
+        self,
+        extrinsic_hash: str,
+        block_hash: str | None = None,
+        block_number: int | None = None,
+    ):
         self.extrinsic_hash = extrinsic_hash
+        self.block_hash = block_hash
+        self.block_number = block_number
 
 
 class _FakeExtrinsicResponse:
@@ -110,6 +119,80 @@ class TestExtractTxHash(unittest.TestCase):
 
     def test_none_returns_none(self):
         self.assertIsNone(_extract_tx_hash(None))
+
+
+# ── _extract_block_hash / _extract_block_number (v2) ───────────────
+
+class TestExtractBlockHash(unittest.TestCase):
+
+    def test_sdk_response_with_receipt_block_hash(self):
+        r = _FakeExtrinsicResponse(
+            extrinsic_receipt=_FakeReceipt(
+                extrinsic_hash="0xabc", block_hash="0xblock123"
+            ),
+        )
+        self.assertEqual(_extract_block_hash(r), "0xblock123")
+
+    def test_sdk_response_receipt_no_block_hash(self):
+        r = _FakeExtrinsicResponse(
+            extrinsic_receipt=_FakeReceipt(extrinsic_hash="0xabc"),
+        )
+        self.assertIsNone(_extract_block_hash(r))
+
+    def test_sdk_response_no_receipt(self):
+        r = _FakeExtrinsicResponse(extrinsic_receipt=None)
+        self.assertIsNone(_extract_block_hash(r))
+
+    def test_dict_shape(self):
+        self.assertEqual(
+            _extract_block_hash({"block_hash": "0xdict_block"}),
+            "0xdict_block",
+        )
+
+    def test_boolean_and_none_safe(self):
+        self.assertIsNone(_extract_block_hash(True))
+        self.assertIsNone(_extract_block_hash(False))
+        self.assertIsNone(_extract_block_hash(None))
+
+
+class TestExtractBlockNumber(unittest.TestCase):
+
+    def test_sdk_response_with_receipt_block_number(self):
+        r = _FakeExtrinsicResponse(
+            extrinsic_receipt=_FakeReceipt(
+                extrinsic_hash="0xabc", block_number=4_200_000
+            ),
+        )
+        self.assertEqual(_extract_block_number(r), 4_200_000)
+
+    def test_sdk_response_receipt_no_block_number(self):
+        r = _FakeExtrinsicResponse(
+            extrinsic_receipt=_FakeReceipt(extrinsic_hash="0xabc"),
+        )
+        self.assertIsNone(_extract_block_number(r))
+
+    def test_dict_shape_with_int(self):
+        self.assertEqual(
+            _extract_block_number({"block_number": 1234}),
+            1234,
+        )
+
+    def test_dict_shape_with_string_coerces(self):
+        self.assertEqual(
+            _extract_block_number({"block_number": "1234"}),
+            1234,
+        )
+
+    def test_dict_shape_with_negative_returns_none(self):
+        self.assertIsNone(_extract_block_number({"block_number": -1}))
+
+    def test_dict_shape_with_garbage_returns_none(self):
+        self.assertIsNone(_extract_block_number({"block_number": "not-a-number"}))
+
+    def test_boolean_and_none_safe(self):
+        self.assertIsNone(_extract_block_number(True))
+        self.assertIsNone(_extract_block_number(False))
+        self.assertIsNone(_extract_block_number(None))
 
 
 # ── _extract_partial_fee_tao (gas/extrinsic fee) ───────────────────
@@ -438,6 +521,76 @@ class TestEmitReceiptEndToEnd(unittest.TestCase):
             pool_tao_post=None, pool_alpha_post=None,
             coldkey_ss58=None, hotkey_ss58=None,
         )
+
+    def test_v2_block_fields_populated_from_sdk_receipt(self):
+        """v2: block_hash + block_number flow through from the SDK
+        ExtrinsicReceipt into the emitted fee-receipt record."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "fee_receipts.jsonl"
+            te = TradeExecutor(
+                client=MagicMock(), fee_log_path=p, bot_id="testbot",
+            )
+            tr = TradeResult(
+                success=True, netuid=23, trade_type="buy",
+                tao_amount=0.5, alpha_amount=100.0, price=0.005,
+                slippage=0.1, reason="entry",
+            )
+            raw_result = _FakeExtrinsicResponse(
+                success=True,
+                extrinsic_fee=_FakeBalance(rao=8_400),
+                extrinsic_receipt=_FakeReceipt(
+                    extrinsic_hash="0xbuy_hash",
+                    block_hash="0xdeadbeef_block",
+                    block_number=4_200_001,
+                ),
+                transaction_tao_fee=_FakeBalance(rao=252_000),
+            )
+            te._emit_fee_receipt(
+                trade_type="buy", netuid=23,
+                tao_amount_requested=0.5, alpha_amount_requested=None,
+                rate_tolerance=0.03,
+                extrinsic_status=_status_from_tr(tr),
+                raw_result=raw_result,
+                pool_tao_at_submit=1000.0, pool_alpha_at_submit=20000.0,
+                pool_tao_post=1000.5, pool_alpha_post=19900.0,
+                coldkey_ss58="5D", hotkey_ss58="5G",
+            )
+            te._fee_writer.close()
+            time.sleep(0.1)
+
+            import json
+            rec = json.loads(p.read_text().strip())
+            self.assertEqual(rec["schema_version"], 2)
+            self.assertEqual(rec["block_hash"], "0xdeadbeef_block")
+            self.assertEqual(rec["block_number"], 4_200_001)
+            # extrinsic_index deferred — populated by later parser work (F2)
+            self.assertIsNone(rec["extrinsic_index"])
+
+    def test_v2_block_fields_null_when_receipt_missing(self):
+        """Timeouts (no receipt) still write a record; v2 block fields null."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "fee_receipts.jsonl"
+            te = TradeExecutor(
+                client=MagicMock(), fee_log_path=p, bot_id="testbot",
+            )
+            te._emit_fee_receipt(
+                trade_type="buy", netuid=1,
+                tao_amount_requested=0.5, alpha_amount_requested=None,
+                rate_tolerance=0.03, extrinsic_status="timeout",
+                raw_result=None,
+                pool_tao_at_submit=None, pool_alpha_at_submit=None,
+                pool_tao_post=None, pool_alpha_post=None,
+                coldkey_ss58=None, hotkey_ss58=None,
+            )
+            te._fee_writer.close()
+            time.sleep(0.1)
+
+            import json
+            rec = json.loads(p.read_text().strip())
+            self.assertEqual(rec["schema_version"], 2)
+            self.assertIsNone(rec["block_hash"])
+            self.assertIsNone(rec["block_number"])
+            self.assertIsNone(rec["extrinsic_index"])
 
 
 if __name__ == "__main__":
