@@ -54,6 +54,7 @@ class TestTradeLogWriter(unittest.TestCase):
             "tao_amount": 0.5, "alpha_amount": 100.0,
             "requested_tao_amount": 0.5, "executed_price": 0.005,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
         })
         w.close()
         time.sleep(0.1)
@@ -78,6 +79,7 @@ class TestTradeLogWriter(unittest.TestCase):
             "tao_amount": 0.5, "alpha_amount": 100.0,
             "executed_price": 0.005,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
         })
         w.close()
         time.sleep(0.1)
@@ -100,6 +102,7 @@ class TestTradeLogWriter(unittest.TestCase):
             "tao_amount": 0.5, "alpha_amount": 100.0,
             "requested_tao_amount": 0.5, "executed_price": 0.005,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
         })
         w.log_mtm({
             "netuid": 107, "is_paper": True,
@@ -149,6 +152,7 @@ class TestPnL(unittest.TestCase):
             "tao_amount": tao, "alpha_amount": alpha,
             "requested_tao_amount": tao, "executed_price": price,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
         })
 
     def _sell(self, tao, alpha, price):
@@ -160,6 +164,7 @@ class TestPnL(unittest.TestCase):
             "tao_amount": tao, "alpha_amount": alpha,
             "requested_alpha_amount": alpha, "executed_price": price,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
         })
 
     def test_fifo_roundtrip(self):
@@ -203,6 +208,7 @@ class TestPnL(unittest.TestCase):
             "requested_alpha_amount": 102.0, "executed_price": 0.014705882,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
             "alpha_yield_accrued": 2.0,
+            "execution_mode": "backtest",
         })
         self.w.close()
         time.sleep(0.1)
@@ -223,6 +229,7 @@ class TestPnL(unittest.TestCase):
             "requested_tao_amount": 1.0, "executed_price": 0.01,
             "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
             "swap_fee_tao": 0.0005, "gas_fee_tao": 8.4e-6, "proxy_fee_tao": 1e-6,
+            "execution_mode": "backtest",
         })
         self._sell(1.5, 100.0, 0.015)  # no explicit fees → 0
         self.w.close()

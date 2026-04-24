@@ -182,6 +182,46 @@ class TradeRecord(_SubnetRecord):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _validate_failure_reason(self):
+        """v2 enforcement: status='failed' records must carry a
+        failure_reason. Gated on schema_version >= 2 so v1 records
+        (which never had this field) continue to parse cleanly.
+
+        Current canonical emission paths (all in paper_base.py as of
+        2026-04-23) already set failure_reason on every failed path:
+            - simulate_execution layer 1 (random_reject)
+            - simulate_execution layer 3 (rate_tolerance)
+            - _orphan_pending_order (orphaned)
+
+        Live-bot emission via BaseBotLoop / TradeExecutor writes to
+        the legacy SQLite trade_log, not the canonical
+        TradeLogWriter — so this validator never fires on live paths
+        today. If a future commit adds canonical live-side emission,
+        this validator will force failure_reason to be set at that
+        commit time.
+        """
+        if (self.schema_version >= 2
+                and self.status == Status.FAILED
+                and self.failure_reason is None):
+            raise ValueError(
+                "failure_reason is required when status='failed' "
+                "under schema_version >= 2"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_execution_mode_required(self):
+        """v2 enforcement: execution_mode must be set. Gated on
+        schema_version >= 2 so v1 records continue to parse.
+        """
+        if self.schema_version >= 2 and self.execution_mode is None:
+            raise ValueError(
+                "execution_mode is required under schema_version >= 2 "
+                "(one of: csv_only, hybrid, live, replay, backtest)"
+            )
+        return self
+
 
 class MTMSample(_SubnetRecord):
     record_type: Literal["mtm_sample"]
