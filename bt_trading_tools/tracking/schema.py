@@ -1,5 +1,5 @@
 """
-Trade log schema v1 — canonical data contract.
+Trade log schema v2 — canonical data contract.
 
 See bt-trading-tools/docs/trade_log_schema.md for the full spec.
 
@@ -8,6 +8,12 @@ Three record types live in a single JSONL log per bot:
     - `mtm_sample`         A mark-to-market observation of an open position.
     - `portfolio_snapshot` A per-tick bot-wide equity snapshot
                            (drives equity curve, drawdown, Sharpe).
+
+v2 (2026-04-23) promoted from extras to canonical on TradeRecord:
+    `failure_reason`, `latency_ms`, `execution_mode`, and three
+    meta-agent booleans (`meta_circuit_breaker_active`,
+    `meta_novelty_gate_active`, `meta_stale_inputs`). The same three
+    booleans are added to PortfolioSnapshot. MTMSample is unchanged.
 """
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ from typing import Annotated, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Side(str, Enum):
@@ -58,6 +64,25 @@ class AlphaYieldSource(str, Enum):
     CHAIN = "chain"
     EMPIRICAL = "empirical"
     FALLBACK = "fallback"
+
+
+class ExecutionMode(str, Enum):
+    """Execution context that produced a trade record.
+
+    - csv_only:  paper bot with CSV pool history + realism layer.
+    - hybrid:    paper bot with live pool-state fetch + realism layer.
+    - live:      real chain-signing bot.
+    - replay:    historical-replay harness (re-runs paper bot against past pools).
+    - backtest:  backtest engine (simulated pools, simulated ticks).
+
+    Optional in v2 schema (Commit 1a); promoted to required in v2-enforced
+    (Commit 1b) after every trade-emission path is audited.
+    """
+    CSV_ONLY = "csv_only"
+    HYBRID = "hybrid"
+    LIVE = "live"
+    REPLAY = "replay"
+    BACKTEST = "backtest"
 
 
 # ── Base classes ──────────────────────────────────────────────────
@@ -119,6 +144,14 @@ class TradeRecord(_SubnetRecord):
     wallet_hotkey: Optional[str] = None
     validator_hotkey: Optional[str] = None
 
+    # v2 fields (2026-04-23). See trade_log_schema.md §4.7–§4.9.
+    failure_reason: Optional[str] = None
+    latency_ms: Optional[int] = Field(default=None, ge=0)
+    execution_mode: Optional[ExecutionMode] = None
+    meta_circuit_breaker_active: bool = False
+    meta_novelty_gate_active: bool = False
+    meta_stale_inputs: bool = False
+
     @model_validator(mode="after")
     def _validate_requested_pairing(self):
         if self.side == Side.BUY:
@@ -172,6 +205,13 @@ class PortfolioSnapshot(_RootRecord):
     total_equity_tao: float = Field(ge=0)         # capital + positions_value
     realized_pnl_to_date_tao: float                # can be negative
     open_positions_count: int = Field(ge=0)
+
+    # v2 fields (2026-04-23): meta-agent state at snapshot time. Lets the
+    # fleet-dashboard audit whether bots honored halt/novelty/stale signals
+    # on each tick without cross-joining to allocation.json by timestamp.
+    meta_circuit_breaker_active: bool = False
+    meta_novelty_gate_active: bool = False
+    meta_stale_inputs: bool = False
 
 
 Record = Annotated[

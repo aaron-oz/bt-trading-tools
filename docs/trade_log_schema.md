@@ -1,7 +1,7 @@
-# Trade Log Schema — v1
+# Trade Log Schema — v2
 
 **Status:** canonical data contract for every bot in the alpha-trading fleet.
-**Schema version:** 1 (locked 2026-04-19).
+**Schema version:** 2 (locked 2026-04-23; v1 locked 2026-04-19).
 **Home:** `bt_trading_tools.tracking` (public-safe; just a data contract — no strategy logic).
 
 Every bot writes trade and mark-to-market (MTM) records through `bt_trading_tools.tracking` in the format defined here. The `meta-agent` and downstream analysis tools consume these logs. Keeping the format uniform across the fleet is a prerequisite for the signal × bot effect matrix and for apples-to-apples P&L across strategies.
@@ -42,7 +42,7 @@ Hard contracts:
 |---|---|---|---|
 | `schema_version` | `int` | yes | Start at 1. Bump on breaking changes. |
 | `bot_id` | `str` | yes | Must match `bot_id` in the bot's manifest. |
-| `timestamp` | `str` (ISO 8601 UTC) | yes | Event time. For trades: execution time. For mtm_sample and portfolio_snapshot: the bot's tick time. |
+| `timestamp` | `str` (ISO 8601 UTC) | yes | Event time. For trades: the moment the trade record is emitted — **submission time** for deferred-settlement paper bots (log fires inside `apply_actions` with realized values already computed), **execution time** for live bots. For `mtm_sample` and `portfolio_snapshot`: the bot's tick time. |
 | `record_type` | `"trade"` \| `"mtm_sample"` \| `"portfolio_snapshot"` | yes | See §2. |
 | `is_paper` | `bool` | yes | True for paper trading; false for live chain trades. |
 
@@ -144,6 +144,28 @@ Chain audit data (which sees coldkey, validator hotkey, netuid, amount — but n
 
 **Note on architecture:** the fleet uses one ledger coldkey per bot (HD-derived from a single seed), each with one delegated proxy coldkey for staking-only signatures. Because proxy semantics route on-chain attribution to the real (ledger) account, `wallet_coldkey` in the trade log is always the bot's ledger coldkey, never the proxy. Each bot has exactly one `(wallet_coldkey, wallet_hotkey)` identity on chain.
 
+### 4.7 Execution diagnostics (v2)
+
+Promoted from pass-through extras in v2 (2026-04-23). `failure_reason` makes status=failed records forensically explicit; `latency_ms` is not reconstructable after the fact (submission-to-inclusion timing isn't recoverable from chain state alone).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `failure_reason` | `str` \| `null` | required when `status="failed"` (v2-enforced in Commit 1b) | Short machine-readable reason. Current vocabulary: `random_reject`, `rate_tolerance`, `orphaned` (paper realism), `chain_timeout`, `rpc_error`, `chain_reject`, `insufficient_balance` (live). Null on `executed` / `partial`. |
+| `latency_ms` | `int` (≥0) \| `null` | yes on live; paper sets from Gaussian draw | Submission-to-settlement latency in ms. `null` when not measured. |
+| `execution_mode` | `"csv_only"` \| `"hybrid"` \| `"live"` \| `"replay"` \| `"backtest"` \| `null` | Optional in v2 Commit 1a; required in v2 Commit 1b | Which execution context produced this record. Paper bots emit `csv_only` (CSV pool) or `hybrid` (live pool fetch). Live bots emit `live`. Replay harness emits `replay`; backtest engine emits `backtest`. |
+
+### 4.8 Meta-agent state booleans (v2)
+
+Snapshot of the three meta-agent state flags that were in effect when the bot decided to submit this trade. Promoted from pass-through extras in v2 so CQI audits can query them as typed fields.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `meta_circuit_breaker_active` | `bool` | yes (default `false`) | Meta-agent's `circuit_breaker` flag at the time the bot read allocation.json. `true` means at least one circuit breaker was tripped (see `allocation_schema.md` for reasons vocabulary). |
+| `meta_novelty_gate_active` | `bool` | yes (default `false`) | Mahalanobis novelty gate active. Bots that respect the gate should halt new entries while `true`. |
+| `meta_stale_inputs` | `bool` | yes (default `false`) | Meta-agent detected stale inputs on its last evaluate. Downstream audit: did this bot still honor halt/sizing while inputs were stale? |
+
+These are bot-side **snapshots**, not authoritative meta-agent state — the canonical source is `allocation.json`. They are recorded here so the trade log alone is sufficient to reconstruct "what was the meta-agent saying at trade time?" without a cross-join.
+
 ### 4.6 `category` enum
 
 One of:
@@ -189,6 +211,9 @@ In addition to §3 common fields (bot-wide — NOT §3.1 subnet fields):
 | `total_equity_tao` | `float` (≥ 0) | yes | `capital_tao + positions_value_tao`. Stored explicitly to avoid reconstruction ambiguity. |
 | `realized_pnl_to_date_tao` | `float` | yes | Cumulative realized P&L since the bot's first snapshot. May be negative. |
 | `open_positions_count` | `int` (≥ 0) | yes | Number of held positions at tick time. |
+| `meta_circuit_breaker_active` | `bool` | yes (v2; default `false`) | Same semantics as §4.8 — snapshot of meta-agent's `circuit_breaker` at tick time. |
+| `meta_novelty_gate_active` | `bool` | yes (v2; default `false`) | Same semantics as §4.8. |
+| `meta_stale_inputs` | `bool` | yes (v2; default `false`) | Same semantics as §4.8. |
 
 Backtest engines MUST emit `portfolio_snapshot` on the same tick schedule as trade evaluations. Methodology consistency across backtest/paper/live is the whole point — otherwise equity-curve comparability breaks.
 
@@ -235,10 +260,28 @@ This is a first-class contract of `bt_trading_tools.tracking`, not an implementa
 ## 8. Versioning policy
 
 - `schema_version: 1` is the initial locked contract (2026-04-19).
+- `schema_version: 2` (2026-04-23) promotes `failure_reason`, `latency_ms`, `execution_mode`, and three meta-agent state booleans from pass-through extras to canonical fields. See §8.1 for the full v1 → v2 migration note.
 - Adding a new optional field is NOT a breaking change — it does not bump `schema_version`. Readers MUST tolerate unknown fields.
-- Adding a new required field, renaming a field, changing a field's type, or changing an enum's semantics IS a breaking change — bumps `schema_version` to 2.
+- Adding a new required field, renaming a field, changing a field's type, or changing an enum's semantics IS a breaking change — bumps `schema_version`.
 - Each bumped version ships with a readable migration note in this file and a migration helper in `bt_trading_tools.tracking` where feasible.
 - Readers inspect `schema_version` and dispatch accordingly. Unknown future versions should log a warning and attempt best-effort parsing, not crash.
+
+### 8.1 v1 → v2 migration (2026-04-23)
+
+**Promoted to canonical on TradeRecord** (previously accepted as `extra="allow"` pass-through):
+
+- `failure_reason` (Optional in v2 Commit 1a; **required when `status="failed"` and `schema_version >= 2`** in Commit 1b)
+- `latency_ms` (Optional)
+- `execution_mode` (Optional in Commit 1a; **required** in Commit 1b)
+- `meta_circuit_breaker_active`, `meta_novelty_gate_active`, `meta_stale_inputs` (required booleans; default `false`)
+
+**Promoted to canonical on PortfolioSnapshot**: the three `meta_*` booleans (same defaults).
+
+**MTMSample is unchanged** in v2 — the meta-agent booleans are redundant at per-position granularity; the same information lives on `portfolio_snapshot` at each tick.
+
+**Reader compatibility.** v1 records continue to validate under v2 (the new fields default cleanly). The `_validate_failure_reason` model-validator only enforces the required-when-failed rule on records carrying `schema_version >= 2` — v1 records with `status="failed"` and no `failure_reason` still parse. Writers stamp `SCHEMA_VERSION = 2` on new records.
+
+**Forward-compat convention.** Future v2 → v3 bumps follow the same pattern: new canonical fields default on read, conditional validators gate on `schema_version >= N`.
 
 ---
 
@@ -258,10 +301,10 @@ At 5-minute evaluation cadence × 20 held positions × 6 months, `mtm_sample` re
 
 ## 11. Minimal worked examples
 
-### 11.1 Live buy, clean execution
+### 11.1 Live buy, clean execution (v2)
 
 ```json
-{"schema_version": 1, "bot_id": "autobot", "timestamp": "2026-04-19T14:23:07Z",
+{"schema_version": 2, "bot_id": "autobot", "timestamp": "2026-04-23T14:23:07Z",
  "record_type": "trade", "netuid": 107, "pool_tao": 13421.5, "pool_alpha": 2685432.1,
  "is_paper": false,
  "side": "buy", "status": "executed", "category": "entry", "intent": "mr_entry",
@@ -272,7 +315,9 @@ At 5-minute evaluation cadence × 20 held positions × 6 months, `mtm_sample` re
  "intended_slippage_tolerance_pct": 1.0,
  "swap_fee_tao": 0.000252, "gas_fee_tao": 8.4e-6, "proxy_fee_tao": 1.0e-6, "fee_source": "chain",
  "chain_tx_hash": "0xabc...", "wallet_coldkey": "5Gproxy...", "wallet_hotkey": "5Gbothk...",
- "validator_hotkey": "5Gvalidator..."}
+ "validator_hotkey": "5Gvalidator...",
+ "failure_reason": null, "latency_ms": 14120, "execution_mode": "live",
+ "meta_circuit_breaker_active": false, "meta_novelty_gate_active": false, "meta_stale_inputs": false}
 ```
 
 ### 11.2 Live sell, partial fill, with yield accrued
@@ -302,19 +347,20 @@ At 5-minute evaluation cadence × 20 held positions × 6 months, `mtm_sample` re
  "position_id": "sn52_cycle_2026-04"}
 ```
 
-### 11.3b Portfolio snapshot
+### 11.3b Portfolio snapshot (v2)
 
 ```json
-{"schema_version": 1, "bot_id": "emissions-drought-bot", "timestamp": "2026-04-19T16:00:00Z",
+{"schema_version": 2, "bot_id": "emissions-drought-bot", "timestamp": "2026-04-23T16:00:00Z",
  "record_type": "portfolio_snapshot", "is_paper": true,
  "capital_tao": 42.5, "positions_value_tao": 57.2, "total_equity_tao": 99.7,
- "realized_pnl_to_date_tao": -0.3, "open_positions_count": 4}
+ "realized_pnl_to_date_tao": -0.3, "open_positions_count": 4,
+ "meta_circuit_breaker_active": false, "meta_novelty_gate_active": false, "meta_stale_inputs": false}
 ```
 
-### 11.4 Live trade that failed to execute
+### 11.4 Live trade that failed to execute (v2)
 
 ```json
-{"schema_version": 1, "bot_id": "bagbot", "timestamp": "2026-04-19T17:02:11Z",
+{"schema_version": 2, "bot_id": "bagbot", "timestamp": "2026-04-23T17:02:11Z",
  "record_type": "trade", "netuid": 18, "pool_tao": 4120.9, "pool_alpha": 830121.4,
  "is_paper": false,
  "side": "buy", "status": "failed", "category": "entry", "intent": "grid_buy_level_5",
@@ -325,7 +371,9 @@ At 5-minute evaluation cadence × 20 held positions × 6 months, `mtm_sample` re
  "intended_slippage_tolerance_pct": 0.5,
  "swap_fee_tao": null, "gas_fee_tao": 8.4e-6, "proxy_fee_tao": 1.0e-6, "fee_source": "receipt",
  "chain_tx_hash": null, "wallet_coldkey": "5Gproxy...", "wallet_hotkey": "5Gbothk...",
- "validator_hotkey": "5Gvalidator..."}
+ "validator_hotkey": "5Gvalidator...",
+ "failure_reason": "rate_tolerance", "latency_ms": 18920, "execution_mode": "live",
+ "meta_circuit_breaker_active": false, "meta_novelty_gate_active": false, "meta_stale_inputs": false}
 ```
 
-*(Failed buys still incur extrinsic and proxy fees — the chain charges for the attempt. `swap_fee_tao` is null because no swap occurred.)*
+*(Failed buys still incur extrinsic and proxy fees — the chain charges for the attempt. `swap_fee_tao` is null because no swap occurred. Under v2 and `schema_version >= 2`, `failure_reason` is required on `status="failed"` records; the validator enforces it in schema Commit 1b.)*
