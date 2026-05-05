@@ -3,11 +3,14 @@ Deterministic fee model for Bittensor stake/unstake operations.
 
 Replaces the two historical constants (``SWAP_FEE_RATE=0.0005``,
 ``GAS_FEE_TAO=0.00001``) applied uniformly across paper/backtest with a
-chain-sourced, per-operation fee quote. Three atomic components:
+chain-sourced, per-operation fee quote. Three atomic components
+(empirical values calibrated 2026-05-04 from 62 chain quotes):
 
     swap_fee_tao   — pool liquidity fee (~0.0504% via FeeRate/65535)
-    gas_fee_tao    — extrinsic weight+length fee (~8 µTAO)
-    proxy_fee_tao  — proxy.proxy wrapping overhead (small, non-zero)
+    gas_fee_tao    — extrinsic weight+length fee (~1.18 mTAO mean across
+                      buy/sell; buy 1.34e-3 vs sell 9.15e-4)
+    proxy_fee_tao  — proxy.proxy wrapping overhead (~0.189 mTAO,
+                      side-invariant)
 
 Design goals:
 
@@ -50,11 +53,19 @@ Operation = Literal["add_stake", "remove_stake"]
 # is read-only; this never signs or spends anything.
 DEFAULT_FEE_SIM_SS58 = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX"
 
-# Calibrated fallbacks — derived from docs.learnbittensor.org/learn/fees.
-# Refit after ~1 week of TradeExecutor fee receipts (scripts/calibrate_fees.py).
+# Calibrated fallbacks — empirical means from chain-source FeeQuotes.
+# Calibrated 2026-05-04 from 62 chain-quoted FeeQuotes (4 paper bots:
+# autobot, emissions-drought, quality-dip, doubledip; Apr-May 2026 window).
+# Earlier values (gas=8.4e-6, proxy=1e-6) were docs-derived placeholders;
+# real chain returns ~140× larger across both. Refit again after
+# meaningful fee schedule changes (governance updates).
 FALLBACK_SWAP_RATE: float = 33 / 65535   # ≈ 5.04e-4, the default mechanism-1 FeeRate
-FALLBACK_GAS_TAO: float = 8.4e-6         # mid-range of reference estimate (8.4–10 µTAO)
-FALLBACK_PROXY_TAO: float = 1.0e-6       # order-of-magnitude; refit after calibration
+# Gas fee differs by side: chain-quote mean is 1.34e-3 TAO for add_stake,
+# 9.15e-4 TAO for remove_stake. We use the mean across both sides for the
+# single-constant fallback; the chain-quote path returns the side-correct
+# value when a chain client is wired.
+FALLBACK_GAS_TAO: float = 1.18e-3        # mean of buy (1.34e-3) + sell (9.15e-4)
+FALLBACK_PROXY_TAO: float = 1.89e-4      # proxy.proxy wrapper overhead, side-invariant
 
 DEFAULT_CACHE_TTL_S: float = 900.0       # 15 min; fees don't change intra-tempo
 

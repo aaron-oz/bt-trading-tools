@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from bt_trading_tools.amm import amm_buy, amm_sell, slippage_pct, spot_price
 from bt_trading_tools.backtest.stats import BacktestStats, compute_stats
 from bt_trading_tools.backtest.types import Order, Position, Strategy, SubnetTick, TickData
+from bt_trading_tools.execution import RealismConfig, RealismSimulator
 
 if TYPE_CHECKING:
     from bt_trading_tools.alpha_yield import AlphaYieldModel
@@ -38,9 +39,12 @@ class BacktestResults:
     positions_at_end: dict[int, Position]
 
 
-# Fees matching emission-bot's model (can be overridden)
-DEFAULT_SWAP_FEE_RATE = 0.0005   # 0.05% per swap
-DEFAULT_GAS_FEE_TAO = 0.00001   # gas per transaction
+# Default flat-fee constants — used only when fee_model=None and no chain
+# client is wired. Match the calibrated FeeModel fallbacks (2026-05-04
+# empirical refit from 62 chain-source quotes; see bt_trading_tools/fees.py
+# and docs/fees_and_yield_design.md §1).
+DEFAULT_SWAP_FEE_RATE = 33 / 65535   # ≈ 5.04e-4, default mechanism-1 FeeRate
+DEFAULT_GAS_FEE_TAO = 1.18e-3        # mean of buy (1.34e-3) + sell (9.15e-4)
 
 
 class BacktestEngine:
@@ -78,6 +82,10 @@ class BacktestEngine:
         ticks_per_year: float = 365.0,
         fee_model: FeeModel | None = None,
         yield_model: AlphaYieldModel | None = None,
+        uses_proxy: bool = True,
+        realism_config: RealismConfig | None = None,
+        realism_rng_seed: Optional[int] = 0,
+        pool_safety_checker: Any = None,
     ):
         """
         Extra kwargs (back-compat preserved when both are None):
@@ -92,9 +100,34 @@ class BacktestEngine:
                 idempotent; backtest-time simulated timestamps are used
                 as ``now`` so reruns are deterministic. Trade records
                 (sells) gain ``alpha_yield_accrued``.
+            uses_proxy: When True (default), FeeModel quotes include the
+                ``proxy_fee_tao`` component. The fleet always uses proxy
+                wallets in production, so the backtest defaults to True
+                — matches paper/live execution friction.
+            realism_config: ``RealismConfig`` controlling the five
+                realism layers (random_reject failures, latency, slippage
+                noise, rate-tolerance breach, partial fills). When None,
+                a default ``RealismConfig()`` (enabled=True with calibrated
+                values matching paper bots) is used. **Defaults to ON
+                because backtest friction must mirror paper / live.** Pass
+                ``RealismConfig(enabled=False)`` for non-realism unit
+                tests.
+            realism_rng_seed: Seed for the realism RNG. Defaults to 0 so
+                backtest runs are reproducible — same data + same strategy
+                = same realised outcomes. Pass None for nondeterministic.
+            pool_safety_checker: Optional ``PoolSafetyChecker`` (from
+                ``bt_strategy.regime.pool_safety``) that drops "buy"
+                orders for subnets flagged by the slow_drain / fast_rug /
+                A>S filters — same behaviour as paper bots get via
+                PaperBotBase. Sells are never blocked. Defaults to None
+                (no filter); pass an instance to align backtest filtering
+                with paper. Construct via:
+                ``PoolSafetyChecker(DataFramePoolHistoryProvider(pool_history_df))``.
 
-        When both are ``None``, behavior is identical to pre-integration —
-        every existing backtest runs unchanged.
+        Compared to pre-integration: realism layers + proxy fee are now
+        on by default. Existing tests that assert specific deterministic
+        outcomes may need ``realism_config=RealismConfig(enabled=False)``
+        if they're testing engine mechanics rather than realism behaviour.
         """
         self.starting_capital = capital
         self.bot_name = bot_name
@@ -106,7 +139,22 @@ class BacktestEngine:
         self.portfolio_log = portfolio_log
         self.ticks_per_year = ticks_per_year
         self.fee_model = fee_model
-        self.yield_model = yield_model
+        # Yield is on by default. When the caller doesn't pass a yield_model,
+        # use the env-driven default cascade (TAOSTATS_API_KEY, BT_NETWORK,
+        # TAOSTATS_DATA_DIR). In test environments with no env vars set, the
+        # cascade fast-fails to zero — same effective behavior as the
+        # historical default, but safe-by-default in production usage.
+        if yield_model is None:
+            from bt_trading_tools.alpha_yield import build_default_yield_model
+            self.yield_model = build_default_yield_model()
+        else:
+            self.yield_model = yield_model
+        self.uses_proxy = uses_proxy
+        self._realism = RealismSimulator(
+            realism_config or RealismConfig(),
+            rng_seed=realism_rng_seed,
+        )
+        self.pool_safety_checker = pool_safety_checker
 
     def run(
         self,
@@ -135,6 +183,13 @@ class BacktestEngine:
         pending_orders: list[tuple[int, Order, SubnetTick | None]] = []
 
         for tick_idx, tick in enumerate(ticks):
+            # ── Refresh pool-safety checker once per tick (clears its
+            # per-subnet cache so subsequent check() calls see fresh data) ─
+            if self.pool_safety_checker is not None:
+                try:
+                    self.pool_safety_checker.refresh()
+                except Exception:
+                    pass  # provider's refresh() may no-op or raise; non-fatal
             # ── Execute delayed orders ───────────────────────────
             if self.execution_delay > 0:
                 ready = [
@@ -280,7 +335,7 @@ class BacktestEngine:
             return None
 
         if order.side == "buy":
-            return self._execute_buy(order, st, tick, capital, positions)
+            return self._execute_buy(order, st, tick, capital, positions, trades)
         elif order.side == "sell":
             return self._execute_sell(order, st, tick, capital, positions, trades)
         return None
@@ -292,6 +347,7 @@ class BacktestEngine:
         tick: TickData,
         capital: float,
         positions: dict[int, Position],
+        trades: list[dict],
     ) -> float | None:
         """Execute a buy order. Returns updated capital."""
         spend = order.tao_amount
@@ -302,6 +358,37 @@ class BacktestEngine:
         # the current price exceeds it, skip — the market moved away.
         if order.limit_price is not None and st.price > order.limit_price:
             return None
+
+        # ── Pool-safety filter (matches paper-bot behavior) ──────
+        # Drop buys for subnets flagged by slow_drain / fast_rug / A>S.
+        # Sells are NEVER blocked — exits must always be allowed. Same
+        # convention as PaperBotBase._filter_unsafe_actions.
+        if self.pool_safety_checker is not None:
+            try:
+                flags = self.pool_safety_checker.check(order.netuid)
+                if flags is not None and getattr(flags, "any_unsafe", False):
+                    failed = {
+                        "netuid": order.netuid,
+                        "entry_time": tick.timestamp,
+                        "exit_time": None,
+                        "entry_price": st.price,
+                        "exit_price": None,
+                        "alpha_qty": 0,
+                        "tao_cost": 0,
+                        "tao_received": 0,
+                        "pnl": 0,
+                        "fees": 0,
+                        "hold_seconds": 0,
+                        "reason": order.reason,
+                        "status": "failed",
+                        "failure_reason": "pool_safety",
+                        "side": "buy",
+                    }
+                    trades.append(failed)
+                    self._record_trade(failed, "buy")
+                    return None
+            except Exception:
+                pass  # fail-open on data-access errors; never block trading on infra
 
         # Cap at max pool percentage
         max_by_pool = st.tao_pool * self.max_pool_pct
@@ -324,6 +411,51 @@ class BacktestEngine:
             return None
 
         eff_price = spend / alpha_received  # total cost basis
+
+        # ── Realism layer ──────────────────────────────────────────
+        # Apply random_reject / latency / slippage_noise / rate_tolerance /
+        # partial_fill against the AMM result. Same code path used by
+        # PaperBotBase so paper/backtest realism cannot drift.
+        action = {
+            "type": "buy",
+            "netuid": order.netuid,
+            "tao_spent": spend,
+            "alpha_qty": alpha_received,
+            "price": eff_price,
+            "decision_pool_tao": st.tao_pool,
+            "decision_pool_alpha": st.alpha_pool,
+        }
+        self._realism.simulate_fill(action)
+        if action.get("status") == "failed":
+            # No state change. Record a failed trade for accounting.
+            failed_trade = {
+                "netuid": order.netuid,
+                "entry_time": tick.timestamp,
+                "exit_time": None,
+                "entry_price": eff_price,
+                "exit_price": None,
+                "alpha_qty": 0,
+                "tao_cost": 0,
+                "tao_received": 0,
+                "pnl": 0,
+                "fees": 0,
+                "hold_seconds": 0,
+                "reason": order.reason,
+                "status": "failed",
+                "failure_reason": action.get("failure_reason"),
+                "latency_ms": action.get("latency_ms"),
+                "side": "buy",
+            }
+            trades.append(failed_trade)
+            self._record_trade(failed_trade, "buy")
+            return None
+        # Realism may have mutated spend/alpha_received via slippage_noise
+        # or partial_fill. Use the post-realism values for state mutation.
+        spend = action["tao_spent"]
+        alpha_received = action["alpha_qty"]
+        if alpha_received <= 0:
+            return None
+        eff_price = spend / alpha_received
 
         # Accumulate into existing position or create new.
         # FIX (Bug #1): cost-weighted average, not overwrite.
@@ -437,6 +569,48 @@ class BacktestEngine:
             fee = 0.0
             fee_components = {}
 
+        # ── Realism layer (sell) ───────────────────────────────────
+        # Same simulator as buy. On failure the position stays put — sell
+        # didn't happen. On partial_fill the alpha_to_sell + tao_received
+        # are scaled down.
+        sell_action = {
+            "type": "sell",
+            "netuid": order.netuid,
+            "alpha_qty": alpha_to_sell,
+            "tao_received": tao_received,
+            "exit_price": tao_received / alpha_to_sell if alpha_to_sell > 0 else 0,
+            "decision_pool_tao": use_pool_tao,
+            "decision_pool_alpha": use_pool_alpha,
+        }
+        self._realism.simulate_fill(sell_action)
+        if sell_action.get("status") == "failed":
+            failed_trade = {
+                "netuid": order.netuid,
+                "entry_time": pos.entry_time,
+                "exit_time": None,
+                "entry_price": pos.entry_price,
+                "exit_price": None,
+                "alpha_qty": 0,
+                "tao_cost": 0,
+                "tao_received": 0,
+                "pnl": 0,
+                "fees": 0,
+                "hold_seconds": tick.timestamp - pos.entry_time,
+                "reason": order.reason,
+                "status": "failed",
+                "failure_reason": sell_action.get("failure_reason"),
+                "latency_ms": sell_action.get("latency_ms"),
+                "side": "sell",
+            }
+            trades.append(failed_trade)
+            self._record_trade(failed_trade, "sell")
+            return None
+        # Apply realism's possibly-mutated values.
+        alpha_to_sell = sell_action["alpha_qty"]
+        tao_received = sell_action["tao_received"]
+        if alpha_to_sell <= 0:
+            return None
+
         # Proportional cost basis — yield alpha has zero cost basis
         # (matches pnl.py semantics). For a full close, cost_of_sold is the
         # entire pos.tao_cost; for a partial sell, proportional to
@@ -492,12 +666,18 @@ class BacktestEngine:
     ) -> tuple[float, dict]:
         """Return (total_fee, extra_trade_fields)."""
         if self.fee_model is None:
+            # Flat-rate path also includes a calibrated proxy fee component
+            # when uses_proxy=True (default) — see fees.FALLBACK_PROXY_TAO.
+            # Otherwise just swap + gas (back-compat for explicit no-proxy).
+            from bt_trading_tools.fees import FALLBACK_PROXY_TAO
             fee = spend * self.swap_fee_rate + self.gas_fee_tao
+            if self.uses_proxy:
+                fee += FALLBACK_PROXY_TAO
             return fee, {}
         spot = pool_tao / pool_alpha if pool_alpha > 0 else None
         q = self.fee_model.quote(
             "add_stake", netuid=netuid, amount=spend,
-            uses_proxy=True, spot_price=spot,
+            uses_proxy=self.uses_proxy, spot_price=spot,
         )
         return q.total_fee_tao, {
             "swap_fee_tao": q.swap_fee_tao,
@@ -513,14 +693,18 @@ class BacktestEngine:
         """Return (total_fee, extra_trade_fields)."""
         if self.fee_model is None:
             # Historical engine computed fee from tao_out, not alpha_qty.
-            # Reproduce that path exactly for back-compat.
+            # Reproduce that path exactly for back-compat. Add proxy fee
+            # when uses_proxy=True (default).
+            from bt_trading_tools.fees import FALLBACK_PROXY_TAO
             tao_out, _, _ = amm_sell(alpha_qty, pool_tao, pool_alpha)
             fee = tao_out * self.swap_fee_rate + self.gas_fee_tao
+            if self.uses_proxy:
+                fee += FALLBACK_PROXY_TAO
             return fee, {}
         spot = pool_tao / pool_alpha if pool_alpha > 0 else None
         q = self.fee_model.quote(
             "remove_stake", netuid=netuid, amount=alpha_qty,
-            uses_proxy=True, spot_price=spot,
+            uses_proxy=self.uses_proxy, spot_price=spot,
         )
         return q.total_fee_tao, {
             "swap_fee_tao": q.swap_fee_tao,

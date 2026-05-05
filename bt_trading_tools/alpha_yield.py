@@ -475,6 +475,109 @@ class EmpiricalYieldProvider:
         self._loaded_at = now
 
 
+# ── Default model factory ─────────────────────────────────────────────
+
+def build_default_yield_model() -> "AlphaYieldModel":
+    """Construct an ``AlphaYieldModel`` with an env-driven cascade.
+
+    Auto-selects providers based on environment variables that the
+    production fleet always sets. Each provider is included only when
+    its required configuration is present, so test environments
+    (no env vars set) get a Taostats-only cascade that fast-fails to
+    zero — no slow chain RPC attempts.
+
+    Configuration:
+
+        TAOSTATS_API_KEY    → enables TaostatsYieldProvider (live API)
+        BT_NETWORK          → enables ChainYieldProvider (live chain RPC)
+        TAOSTATS_DATA_DIR   → enables EmpiricalYieldProvider (historical CSV)
+
+    Cascade order matches yield-data freshness preference: live API >
+    live chain > historical CSV > built-in zero fallback.
+
+    This function is the canonical default for both ``PaperBotBase`` and
+    ``BacktestEngine``. Production paper bots have all three env vars
+    set in their systemd units, so they get full live yield. Backtests
+    that set ``TAOSTATS_DATA_DIR`` get historical yield from the CSV.
+
+    Returns:
+        ``AlphaYieldModel`` with a ``CascadingYieldProvider`` whose tier
+        list reflects the current environment. The cascade itself never
+        raises (last-tier built-in fallback is zero with source=FALLBACK).
+    """
+    import os
+    from pathlib import Path
+
+    providers: list[YieldRateProvider] = []
+
+    # Always include Taostats first — it fast-fails when no API key is set,
+    # so this is safe in test environments. In production it's the freshest
+    # source.
+    providers.append(TaostatsYieldProvider())
+
+    # Chain RPC: only include when BT_NETWORK is explicitly configured. Skip
+    # in test environments to avoid slow chain-connect timeouts on every
+    # cascade tier-fall-through.
+    bt_network = os.environ.get("BT_NETWORK")
+    if bt_network:
+        providers.append(ChainYieldProvider(network=bt_network))
+
+    # Empirical CSV: only include when TAOSTATS_DATA_DIR points at a real
+    # directory. Backtests set this to the data dir; paper bots may also
+    # set it for fall-through if both API and chain are down.
+    data_dir = os.environ.get("TAOSTATS_DATA_DIR")
+    if data_dir and Path(data_dir).exists():
+        providers.append(EmpiricalYieldProvider(data_dir=data_dir))
+
+    return AlphaYieldModel(CascadingYieldProvider(providers))
+
+
+# ── Validator dilution ────────────────────────────────────────────────
+
+def dilute_apy(
+    headline_apy: float,
+    our_alpha: float,
+    validator_stake_alpha: float,
+) -> float:
+    """Validator yield diluted by adding our position to the validator's stake pool.
+
+    A validator's per-stake yield is split pro-rata among delegators. When we
+    delegate ``our_alpha`` to a validator already holding ``validator_stake_alpha``,
+    our slice of the per-epoch alpha bucket is::
+
+        our_share = our_alpha / (validator_stake_alpha + our_alpha)
+
+    For the *headline_apy* (our_alpha=0 reference, ignoring our own contribution),
+    the validator's per-stake yield is approximately:
+
+        per_stake_apy = headline_apy / our_alpha     # NOT directly useful
+
+    The realized APY for our position after dilution is::
+
+        diluted_apy = headline_apy × validator_stake_alpha / (validator_stake_alpha + our_alpha)
+
+    For ``our_alpha << validator_stake_alpha`` this reduces to ``headline_apy``
+    (no dilution). For ``our_alpha == validator_stake_alpha`` we get half.
+
+    Args:
+        headline_apy: validator's reported APY before our position joins.
+        our_alpha: our position size in alpha tokens.
+        validator_stake_alpha: validator's existing stake in alpha tokens.
+
+    Returns:
+        Realized APY after dilution. Returns 0.0 if validator_stake_alpha ≤ 0
+        (no pool to dilute into → cannot earn yield).
+
+    Raises:
+        ValueError: if our_alpha < 0.
+    """
+    if our_alpha < 0:
+        raise ValueError(f"our_alpha must be non-negative, got {our_alpha}")
+    if validator_stake_alpha <= 0:
+        return 0.0
+    return headline_apy * validator_stake_alpha / (validator_stake_alpha + our_alpha)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────
 
 def _finite(x: float) -> bool:

@@ -20,6 +20,7 @@ from bt_trading_tools.alpha_yield import (
     CascadingYieldProvider,
     YieldRate,
     ZeroYieldProvider,
+    dilute_apy,
 )
 from bt_trading_tools.tracking.schema import AlphaYieldSource
 
@@ -207,6 +208,50 @@ class TestModelAcceptsBareProvider(unittest.TestCase):
         yr = m.rate(netuid=1)
         self.assertEqual(yr.rate_per_day, 0.0)
         self.assertEqual(yr.source, AlphaYieldSource.FALLBACK)
+
+
+class TestDiluteApy(unittest.TestCase):
+    """dilute_apy: validator's APY after our position joins their stake pool."""
+
+    def test_no_dilution_when_our_position_is_tiny(self):
+        # 1 alpha into a 10000-alpha validator → effectively no dilution
+        diluted = dilute_apy(headline_apy=0.50, our_alpha=1.0, validator_stake_alpha=10000.0)
+        self.assertAlmostEqual(diluted, 0.50, places=3)
+
+    def test_half_apy_when_we_match_validator_stake(self):
+        # our_alpha == validator_stake → diluted to half
+        diluted = dilute_apy(headline_apy=0.50, our_alpha=1000.0, validator_stake_alpha=1000.0)
+        self.assertAlmostEqual(diluted, 0.25)
+
+    def test_quarter_apy_when_we_triple_validator_stake(self):
+        # our_alpha = 3 × validator_stake → split is 1:3, validator-side share = 1/4
+        diluted = dilute_apy(headline_apy=0.40, our_alpha=3000.0, validator_stake_alpha=1000.0)
+        self.assertAlmostEqual(diluted, 0.10)
+
+    def test_zero_validator_stake_returns_zero(self):
+        # No existing stake to delegate to → cannot earn yield
+        self.assertEqual(
+            dilute_apy(headline_apy=0.50, our_alpha=100.0, validator_stake_alpha=0.0),
+            0.0,
+        )
+
+    def test_zero_our_position_returns_headline(self):
+        # Reference case: our position = 0 means we ARE the headline
+        self.assertEqual(
+            dilute_apy(headline_apy=0.42, our_alpha=0.0, validator_stake_alpha=10000.0),
+            0.42,
+        )
+
+    def test_negative_our_alpha_raises(self):
+        with self.assertRaises(ValueError):
+            dilute_apy(headline_apy=0.50, our_alpha=-1.0, validator_stake_alpha=1000.0)
+
+    def test_negative_validator_stake_returns_zero(self):
+        # Garbage in (negative stake) → 0 rather than crash
+        self.assertEqual(
+            dilute_apy(headline_apy=0.50, our_alpha=100.0, validator_stake_alpha=-1.0),
+            0.0,
+        )
 
 
 if __name__ == "__main__":
