@@ -18,8 +18,10 @@ import unittest
 from bt_trading_tools.alpha_yield import (
     AlphaYieldModel,
     CascadingYieldProvider,
+    ValidatorCacheYieldProvider,
     YieldRate,
     ZeroYieldProvider,
+    build_default_yield_model,
     dilute_apy,
 )
 from bt_trading_tools.tracking.schema import AlphaYieldSource
@@ -252,6 +254,214 @@ class TestDiluteApy(unittest.TestCase):
             dilute_apy(headline_apy=0.50, our_alpha=100.0, validator_stake_alpha=-1.0),
             0.0,
         )
+
+
+# ── ValidatorCacheYieldProvider (Scope C Phase 2) ──────────────────────
+
+import json
+import tempfile
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+
+def _make_validator_cache(
+    subnets: dict,
+    generated_at: datetime | None = None,
+    schema_version: int = 3,
+) -> dict:
+    """Build a minimal validator-selection cache payload for tests."""
+    if generated_at is None:
+        generated_at = datetime.now(timezone.utc)
+    return {
+        "schema_version": schema_version,
+        "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
+        "data_source": "taostats+chain",
+        "subnets": {
+            str(netuid): {
+                "n_validators_total": len(cands),
+                "n_validators_passing_filters": len(cands),
+                "candidates": cands,
+            }
+            for netuid, cands in subnets.items()
+        },
+    }
+
+
+class TestValidatorCacheYieldProvider(unittest.TestCase):
+    """Phase 2: cache-backed yield provider for fast MTM."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tmpdir.name) / "best_validators.json"
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _write(self, payload: dict) -> None:
+        self.cache_path.write_text(json.dumps(payload))
+
+    def test_returns_stake_weighted_mean_apy_per_day(self):
+        """fetch_rate returns stake-weighted mean apy / 365.
+
+        Two validators on netuid 44:
+          - apy=0.50, stake=10000  →  contributes 0.50 × 10000 = 5000
+          - apy=0.20, stake=40000  →  contributes 0.20 × 40000 = 8000
+        weighted mean = 13000 / 50000 = 0.26
+        per-day = 0.26 / 365 ≈ 7.123e-4
+        """
+        payload = _make_validator_cache({
+            44: [
+                {"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0},
+                {"hotkey": "hk_B", "apy_after_fee": 0.20, "stake_alpha": 40000.0},
+            ]
+        })
+        self._write(payload)
+        prov = ValidatorCacheYieldProvider(cache_path=str(self.cache_path))
+        rate = prov.fetch_rate(netuid=44)
+        self.assertAlmostEqual(rate, 0.26 / 365.0, places=8)
+
+    def test_zero_or_negative_stake_skipped(self):
+        """Candidates with stake_alpha <= 0 don't contribute to the mean."""
+        payload = _make_validator_cache({
+            44: [
+                {"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0},
+                {"hotkey": "hk_B", "apy_after_fee": 9.99, "stake_alpha": 0.0},
+                {"hotkey": "hk_C", "apy_after_fee": 9.99, "stake_alpha": -1.0},
+            ]
+        })
+        self._write(payload)
+        prov = ValidatorCacheYieldProvider(cache_path=str(self.cache_path))
+        rate = prov.fetch_rate(netuid=44)
+        # Only hk_A contributes → mean = 0.50, daily = 0.50/365
+        self.assertAlmostEqual(rate, 0.50 / 365.0, places=8)
+
+    def test_raises_on_stale_cache(self):
+        """Cache older than max_age_s raises so cascade falls through."""
+        old = datetime.now(timezone.utc) - timedelta(hours=48)
+        payload = _make_validator_cache(
+            {44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0}]},
+            generated_at=old,
+        )
+        self._write(payload)
+        prov = ValidatorCacheYieldProvider(
+            cache_path=str(self.cache_path), max_age_s=24 * 3600,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            prov.fetch_rate(netuid=44)
+        self.assertIn("stale", str(ctx.exception))
+
+    def test_raises_on_missing_netuid(self):
+        """Missing subnet → KeyError so cascade falls through."""
+        payload = _make_validator_cache({
+            44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0}]
+        })
+        self._write(payload)
+        prov = ValidatorCacheYieldProvider(cache_path=str(self.cache_path))
+        with self.assertRaises(KeyError):
+            prov.fetch_rate(netuid=99)
+
+    def test_raises_on_no_usable_candidates(self):
+        """Subnet with only zero-stake candidates → ValueError."""
+        payload = _make_validator_cache({
+            44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 0.0}]
+        })
+        self._write(payload)
+        prov = ValidatorCacheYieldProvider(cache_path=str(self.cache_path))
+        with self.assertRaises(ValueError):
+            prov.fetch_rate(netuid=44)
+
+    def test_raises_when_file_missing(self):
+        prov = ValidatorCacheYieldProvider(
+            cache_path=str(self.cache_path / "does_not_exist"),
+        )
+        with self.assertRaises(RuntimeError):
+            prov.fetch_rate(netuid=44)
+
+    def test_cascade_falls_through_on_stale_cache(self):
+        """End-to-end: stale cache provider in front of a working stub →
+        cascade falls to the stub. Verifies the integration contract."""
+        old = datetime.now(timezone.utc) - timedelta(hours=48)
+        payload = _make_validator_cache(
+            {44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0}]},
+            generated_at=old,
+        )
+        self._write(payload)
+        cache_prov = ValidatorCacheYieldProvider(
+            cache_path=str(self.cache_path), max_age_s=24 * 3600,
+        )
+        backup = _StubProvider(rate=0.001, source=AlphaYieldSource.TAOSTATS)
+        cascade = CascadingYieldProvider([cache_prov, backup])
+        rate, source, _err = cascade.fetch_rate_with_source(netuid=44)
+        self.assertEqual(source, AlphaYieldSource.TAOSTATS)
+        self.assertEqual(rate, 0.001)
+        self.assertEqual(backup.calls, 1)
+
+    def test_reload_on_mtime_change(self):
+        """Updating the cache file is reflected on the next fetch."""
+        import os
+        payload1 = _make_validator_cache({
+            44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0}]
+        })
+        self._write(payload1)
+        prov = ValidatorCacheYieldProvider(cache_path=str(self.cache_path))
+        rate1 = prov.fetch_rate(netuid=44)
+        self.assertAlmostEqual(rate1, 0.50 / 365.0, places=8)
+        # Rewrite with different APY + bump mtime
+        time.sleep(0.05)
+        payload2 = _make_validator_cache({
+            44: [{"hotkey": "hk_A", "apy_after_fee": 0.10, "stake_alpha": 10000.0}]
+        })
+        self._write(payload2)
+        new_mtime = time.time()
+        os.utime(self.cache_path, (new_mtime, new_mtime))
+        rate2 = prov.fetch_rate(netuid=44)
+        self.assertAlmostEqual(rate2, 0.10 / 365.0, places=8)
+
+
+class TestBuildDefaultYieldModelCacheFirst(unittest.TestCase):
+    """build_default_yield_model puts ValidatorCacheYieldProvider FIRST when
+    VALIDATOR_CACHE_PATH points at an existing file."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tmpdir.name) / "best_validators.json"
+        self.cache_path.write_text(json.dumps(_make_validator_cache({
+            44: [{"hotkey": "hk_A", "apy_after_fee": 0.50, "stake_alpha": 10000.0}]
+        })))
+
+    def tearDown(self):
+        import os
+        for k in ("VALIDATOR_CACHE_PATH", "BT_NETWORK", "TAOSTATS_DATA_DIR"):
+            os.environ.pop(k, None)
+        self.tmpdir.cleanup()
+
+    def test_cache_provider_first_in_cascade(self):
+        import os
+        os.environ["VALIDATOR_CACHE_PATH"] = str(self.cache_path)
+        # Ensure the chain + empirical providers are NOT included to keep
+        # the cascade list short and easy to reason about.
+        os.environ.pop("BT_NETWORK", None)
+        os.environ.pop("TAOSTATS_DATA_DIR", None)
+        model = build_default_yield_model()
+        # CascadingYieldProvider stores tiers internally; rely on the public
+        # behavior — cache provider at netuid 44 should produce a rate
+        # matching the synthetic cache, sourced as VALIDATOR_CACHE.
+        yr = model.rate(netuid=44)
+        self.assertEqual(yr.source, AlphaYieldSource.VALIDATOR_CACHE)
+        self.assertAlmostEqual(yr.rate_per_day, 0.50 / 365.0, places=8)
+
+    def test_cache_provider_skipped_when_file_missing(self):
+        """If VALIDATOR_CACHE_PATH points at a non-existent file, the cache
+        provider is omitted (no spurious failure on every cascade)."""
+        import os
+        os.environ["VALIDATOR_CACHE_PATH"] = "/nonexistent/path/best_validators.json"
+        os.environ.pop("BT_NETWORK", None)
+        os.environ.pop("TAOSTATS_DATA_DIR", None)
+        model = build_default_yield_model()
+        # Without taostats key + with no cache, taostats-tier raises and
+        # the cascade falls through to the built-in zero fallback.
+        yr = model.rate(netuid=44)
+        self.assertEqual(yr.source, AlphaYieldSource.FALLBACK)
 
 
 if __name__ == "__main__":

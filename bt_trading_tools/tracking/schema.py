@@ -63,6 +63,7 @@ class AlphaYieldSource(str, Enum):
     TAOSTATS = "taostats"
     CHAIN = "chain"
     EMPIRICAL = "empirical"
+    VALIDATOR_CACHE = "validator_cache"
     FALLBACK = "fallback"
 
 

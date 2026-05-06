@@ -202,6 +202,136 @@ class ZeroYieldProvider:
         return 0.0
 
 
+class ValidatorCacheYieldProvider:
+    """Fetch per-subnet yield rate from the validator-selection cache file.
+
+    The cache (written by the daily ``update_validator_selection.py`` cron in
+    the alpha-trading repo) contains per-validator ``apy_after_fee`` (30d-
+    smoothed) plus ``stake_alpha`` per candidate per subnet. We compute the
+    stake-weighted mean across the subnet's candidates and divide by 365 to
+    express a simple-interest daily rate — same convention as
+    ``TaostatsYieldProvider``.
+
+    **Why this exists:** ``TaostatsYieldProvider`` makes a live network call
+    on cache miss (~250ms-5s per call). When a paper bot suddenly has many
+    fresh positions (e.g. a yield-carry rebalance settling), the first MTM
+    iteration hits N cold cache slots → N live API calls → minutes of tick
+    latency. The validator-selection cron already pulls per-validator APY
+    daily, so reading from that cache gives O(1) per-netuid lookup at sub-ms
+    cost. 24h-stale by design — yield rates don't move minute-to-minute
+    meaningfully; the freshness loss is dominated by the speedup.
+
+    **Cache schema:** requires schema_version >= 2 (the 7d/30d split). v3
+    candidates carry chain-fresh metadata too but the yield computation only
+    needs apy_after_fee + stake_alpha, both present since v1.
+
+    **Staleness:** if the file's ``generated_at`` is older than ``max_age_s``
+    (default 36h), raises so the surrounding ``CascadingYieldProvider`` falls
+    through to live providers. 36h matches
+    ``ValidatorSelector.DEFAULT_MAX_AGE_S`` — same convention.
+
+    Strategies that need fresher yield data (none currently planned) can opt
+    out by constructing their own ``AlphaYieldModel`` with
+    ``TaostatsYieldProvider`` first in the cascade.
+    """
+    source = AlphaYieldSource.VALIDATOR_CACHE
+
+    DEFAULT_CACHE_PATH = "/root/.validator_selection/best_validators.json"
+    DEFAULT_MAX_AGE_S: float = 36 * 3600
+
+    def __init__(
+        self,
+        cache_path: "str | None" = None,
+        max_age_s: float = DEFAULT_MAX_AGE_S,
+    ):
+        from pathlib import Path
+        self._cache_path = Path(cache_path or self.DEFAULT_CACHE_PATH)
+        self._max_age_s = max_age_s
+        self._cache: Optional[dict] = None
+        self._cache_mtime: float = 0.0
+
+    def fetch_rate(self, netuid: int) -> float:
+        """Return alpha-per-alpha per-day yield rate, derived from the
+        validator-selection cache file.
+
+        Raises on missing file / stale file / missing netuid / no usable
+        candidates so the cascade falls through to live providers.
+        """
+        self._maybe_reload()
+        if self._cache is None:
+            raise RuntimeError(
+                f"validator-selection cache not loadable at {self._cache_path}"
+            )
+
+        # Staleness gate
+        from datetime import datetime, timezone
+        try:
+            gen = datetime.fromisoformat(
+                self._cache["generated_at"].replace("Z", "+00:00")
+            )
+        except (KeyError, ValueError) as e:
+            raise RuntimeError(
+                f"validator-selection cache missing/invalid generated_at: {e}"
+            )
+        age_s = (datetime.now(timezone.utc) - gen).total_seconds()
+        if age_s > self._max_age_s:
+            raise RuntimeError(
+                f"validator-selection cache stale: {age_s:.0f}s old "
+                f"(max {self._max_age_s:.0f}s)"
+            )
+
+        subnet = self._cache.get("subnets", {}).get(str(netuid))
+        if not subnet:
+            raise KeyError(
+                f"no validator-selection cache entry for netuid={netuid}"
+            )
+        cands = subnet.get("candidates") or []
+        if not cands:
+            raise ValueError(
+                f"no candidates in validator-selection cache for netuid={netuid}"
+            )
+
+        # Stake-weighted mean of 30-day APY (same convention as
+        # TaostatsYieldProvider). apy_after_fee is already 30d-smoothed +
+        # post-take in the cache file.
+        total_stake = 0.0
+        weighted_apy = 0.0
+        for c in cands:
+            stake = _as_float(c.get("stake_alpha"))
+            apy = _as_float(c.get("apy_after_fee"))
+            if stake is None or apy is None or stake <= 0 or apy < 0:
+                continue
+            total_stake += stake
+            weighted_apy += apy * stake
+
+        if total_stake <= 0:
+            raise ValueError(
+                f"no usable (stake, apy) pairs in validator-selection cache "
+                f"for netuid={netuid}"
+            )
+        apy_mean = weighted_apy / total_stake
+        return apy_mean / 365.0
+
+    def _maybe_reload(self) -> None:
+        if not self._cache_path.exists():
+            self._cache = None
+            return
+        mtime = self._cache_path.stat().st_mtime
+        if self._cache is not None and mtime == self._cache_mtime:
+            return
+        import json
+        try:
+            with open(self._cache_path) as f:
+                self._cache = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._cache = None
+            raise RuntimeError(
+                f"failed to read validator-selection cache "
+                f"{self._cache_path}: {e}"
+            )
+        self._cache_mtime = mtime
+
+
 class TaostatsYieldProvider:
     """Fetch per-subnet daily yield rate from taostats.
 
@@ -483,17 +613,23 @@ def build_default_yield_model() -> "AlphaYieldModel":
     Auto-selects providers based on environment variables that the
     production fleet always sets. Each provider is included only when
     its required configuration is present, so test environments
-    (no env vars set) get a Taostats-only cascade that fast-fails to
-    zero — no slow chain RPC attempts.
+    (no env vars set) get a cascade that fast-fails to zero without
+    making slow chain RPC attempts.
 
     Configuration:
 
+        VALIDATOR_CACHE_PATH → enables ValidatorCacheYieldProvider (default
+                               /root/.validator_selection/best_validators.json
+                               if that file exists)
         TAOSTATS_API_KEY    → enables TaostatsYieldProvider (live API)
         BT_NETWORK          → enables ChainYieldProvider (live chain RPC)
         TAOSTATS_DATA_DIR   → enables EmpiricalYieldProvider (historical CSV)
 
-    Cascade order matches yield-data freshness preference: live API >
-    live chain > historical CSV > built-in zero fallback.
+    Cascade order: validator-cache (sub-ms, daily-fresh) > live taostats >
+    live chain > historical CSV > built-in zero fallback. The validator
+    cache is preferred first because it's the fastest path that produces
+    correct values; the live providers handle cache-stale or cache-missing
+    cases via the cascade fall-through.
 
     This function is the canonical default for both ``PaperBotBase`` and
     ``BacktestEngine``. Production paper bots have all three env vars
@@ -510,9 +646,19 @@ def build_default_yield_model() -> "AlphaYieldModel":
 
     providers: list[YieldRateProvider] = []
 
-    # Always include Taostats first — it fast-fails when no API key is set,
-    # so this is safe in test environments. In production it's the freshest
-    # source.
+    # Validator-selection cache first: sub-ms per-netuid lookup, daily-
+    # fresh. Only attached when the file actually exists (default VPS path
+    # or env-overridden), so dev machines without that file fall through to
+    # live providers naturally.
+    cache_path_env = os.environ.get("VALIDATOR_CACHE_PATH")
+    cache_path = Path(
+        cache_path_env or ValidatorCacheYieldProvider.DEFAULT_CACHE_PATH
+    )
+    if cache_path.exists():
+        providers.append(ValidatorCacheYieldProvider(cache_path=str(cache_path)))
+
+    # Taostats live — fast-fails when no API key is set, so this is safe in
+    # test environments. In production it's the freshest source.
     providers.append(TaostatsYieldProvider())
 
     # Chain RPC: only include when BT_NETWORK is explicitly configured. Skip
