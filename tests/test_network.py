@@ -478,5 +478,293 @@ class TestTradeExecutorProxy(unittest.TestCase):
                 "Balance query should use real_account_ss58, not proxy address")
 
 
+# ── valuate_wallet / unstake_all ─────────────────────────────────
+
+
+@dataclass
+class MockStakeInfo:
+    """Mirror of bittensor's StakeInfo dataclass for testing."""
+    netuid: int
+    hotkey_ss58: str
+    stake: MockBalance
+    coldkey_ss58: str = "5Gprincipal"
+
+
+class TestValuateWallet(unittest.TestCase):
+
+    def _make_client(
+        self,
+        balance_per_addr=None,
+        stake_infos=None,
+        subnet_prices=None,
+    ):
+        """Build a client whose mock subtensor produces the given chain data."""
+        client = SubtensorClient()
+        sub = AsyncMock()
+
+        # all_subnets — caller passes {netuid: price} to control.
+        if subnet_prices is None:
+            subnet_prices = {44: 0.005, 64: 0.01}
+        subnets = [
+            MockSubnet(nu, p, MockBalance(100.0), MockBalance(20000.0), f"sn{nu}")
+            for nu, p in subnet_prices.items()
+        ]
+        sub.all_subnets = AsyncMock(return_value=subnets)
+
+        # get_balance — keyed by address argument
+        balance_per_addr = balance_per_addr or {}
+        async def _get_balance(address, **kw):
+            return MockBalance(balance_per_addr.get(address, 0.0))
+        sub.get_balance = AsyncMock(side_effect=_get_balance)
+
+        # get_stake_info_for_coldkey
+        sub.get_stake_info_for_coldkey = AsyncMock(return_value=stake_infos or [])
+
+        sub.close = AsyncMock()
+        sub.wait_for_block = AsyncMock()
+        client._sub = sub
+        return client
+
+    def test_basic_single_coldkey_two_positions(self):
+        """Free balance + two staked positions sum correctly."""
+        from bt_trading_tools.network import valuate_wallet
+        client = self._make_client(
+            balance_per_addr={"5Gprincipal": 1.5},
+            stake_infos=[
+                MockStakeInfo(netuid=44, hotkey_ss58="5Ghk_a", stake=MockBalance(100.0, rao=int(100 * 1e9))),
+                MockStakeInfo(netuid=64, hotkey_ss58="5Ghk_b", stake=MockBalance(50.0, rao=int(50 * 1e9))),
+            ],
+            subnet_prices={44: 0.005, 64: 0.01},
+        )
+        v = asyncio.run(valuate_wallet(client, stake_coldkey_ss58="5Gprincipal"))
+
+        # 100 alpha @ 0.005 = 0.5 TAO; 50 alpha @ 0.01 = 0.5 TAO; staked = 1.0
+        self.assertAlmostEqual(v.staked_tao, 1.0)
+        self.assertAlmostEqual(v.free_tao, 1.5)
+        self.assertAlmostEqual(v.total_tao, 2.5)
+        self.assertEqual(len(v.positions), 2)
+        self.assertEqual(v.n_subnets_with_stake, 2)
+        self.assertEqual(v.free_balance_ss58s, ["5Gprincipal"])
+
+    def test_proxy_pattern_two_balance_addresses(self):
+        """Free balance summed across principal + proxy."""
+        from bt_trading_tools.network import valuate_wallet
+        client = self._make_client(
+            balance_per_addr={"5Gprincipal": 0.0, "5Gproxy": 1.85},
+            stake_infos=[
+                MockStakeInfo(netuid=44, hotkey_ss58="5Ghk", stake=MockBalance(50.0, rao=int(50 * 1e9))),
+            ],
+            subnet_prices={44: 0.01},
+        )
+        v = asyncio.run(valuate_wallet(
+            client,
+            stake_coldkey_ss58="5Gprincipal",
+            free_balance_ss58s=["5Gprincipal", "5Gproxy"],
+        ))
+        # Proxy holds 1.85 TAO free; principal holds 0; staked = 50 * 0.01 = 0.5
+        self.assertAlmostEqual(v.free_tao, 1.85)
+        self.assertAlmostEqual(v.free_tao_per_address["5Gproxy"], 1.85)
+        self.assertAlmostEqual(v.free_tao_per_address["5Gprincipal"], 0.0)
+        self.assertAlmostEqual(v.staked_tao, 0.5)
+        self.assertAlmostEqual(v.total_tao, 2.35)
+
+    def test_no_stake_returns_just_free(self):
+        from bt_trading_tools.network import valuate_wallet
+        client = self._make_client(
+            balance_per_addr={"5Gprincipal": 5.0},
+            stake_infos=[],
+        )
+        v = asyncio.run(valuate_wallet(client, stake_coldkey_ss58="5Gprincipal"))
+        self.assertAlmostEqual(v.total_tao, 5.0)
+        self.assertEqual(v.positions, [])
+        self.assertEqual(v.n_subnets_with_stake, 0)
+
+    def test_skips_zero_alpha_records(self):
+        """Stake records with alpha <= 0 don't contribute to valuation."""
+        from bt_trading_tools.network import valuate_wallet
+        client = self._make_client(
+            balance_per_addr={"5Gprincipal": 0.0},
+            stake_infos=[
+                MockStakeInfo(netuid=44, hotkey_ss58="5Ghk_a", stake=MockBalance(0.0, rao=0)),
+                MockStakeInfo(netuid=64, hotkey_ss58="5Ghk_b", stake=MockBalance(50.0, rao=int(50 * 1e9))),
+            ],
+            subnet_prices={44: 0.005, 64: 0.01},
+        )
+        v = asyncio.run(valuate_wallet(client, stake_coldkey_ss58="5Gprincipal"))
+        self.assertEqual(len(v.positions), 1)
+        self.assertAlmostEqual(v.staked_tao, 0.5)
+        self.assertEqual(v.positions[0].netuid, 64)
+
+
+class TestUnstakeAll(unittest.TestCase):
+
+    def _make_client(self, stake_infos=None, unstake_succeeds=True, unstake_raises=None):
+        client = SubtensorClient()
+        sub = AsyncMock()
+        sub.get_stake_info_for_coldkey = AsyncMock(return_value=stake_infos or [])
+        if unstake_raises is not None:
+            sub.unstake = AsyncMock(side_effect=unstake_raises)
+        else:
+            sub.unstake = AsyncMock(return_value=MockExtrinsicResponse(unstake_succeeds))
+        sub.proxy = AsyncMock(return_value=MockExtrinsicResponse(True))
+        sub.close = AsyncMock()
+        client._sub = sub
+        return client
+
+    def test_dry_run_returns_plan_no_signing(self):
+        """Default dry_run=True returns plan without invoking unstake."""
+        from bt_trading_tools.network import unstake_all
+        client = self._make_client(stake_infos=[
+            MockStakeInfo(netuid=44, hotkey_ss58="5Ghk_a", stake=MockBalance(100.0, rao=int(100 * 1e9))),
+            MockStakeInfo(netuid=64, hotkey_ss58="5Ghk_b", stake=MockBalance(50.0, rao=int(50 * 1e9))),
+        ])
+        result = asyncio.run(unstake_all(client, coldkey_ss58="5Gprincipal"))
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.n_planned, 2)
+        self.assertEqual(result.results, [])
+        # No unstake / proxy extrinsics were submitted
+        client._sub.unstake.assert_not_called()
+        client._sub.proxy.assert_not_called()
+
+    def test_dry_run_false_requires_wallet(self):
+        from bt_trading_tools.network import unstake_all
+        client = self._make_client(stake_infos=[
+            MockStakeInfo(netuid=44, hotkey_ss58="5Ghk", stake=MockBalance(10.0, rao=int(10 * 1e9))),
+        ])
+        with self.assertRaises(ValueError):
+            asyncio.run(unstake_all(
+                client, coldkey_ss58="5Gprincipal", dry_run=False, wallet=None,
+            ))
+
+    def test_executes_direct_unstake_for_each_position(self):
+        """Non-dry-run, non-proxy: one sub.unstake() call per position."""
+        from bt_trading_tools.network import unstake_all
+        client = self._make_client(stake_infos=[
+            MockStakeInfo(netuid=44, hotkey_ss58="5Ghk_a", stake=MockBalance(100.0, rao=int(100 * 1e9))),
+            MockStakeInfo(netuid=64, hotkey_ss58="5Ghk_b", stake=MockBalance(50.0, rao=int(50 * 1e9))),
+        ])
+        # Patch bittensor.Balance.from_tao — needed by unstake_all in non-proxy mode
+        import sys
+        mock_bt = MagicMock()
+        mock_bt.Balance.from_tao.side_effect = lambda x: MockBalance(tao=float(x), rao=int(float(x) * 1e9))
+        saved = sys.modules.get("bittensor")
+        sys.modules["bittensor"] = mock_bt
+        try:
+            mock_wallet = MagicMock()
+            result = asyncio.run(unstake_all(
+                client, coldkey_ss58="5Gprincipal",
+                wallet=mock_wallet, dry_run=False,
+                inter_unstake_delay_s=0.0,
+            ))
+        finally:
+            if saved is None:
+                sys.modules.pop("bittensor", None)
+            else:
+                sys.modules["bittensor"] = saved
+        self.assertFalse(result.dry_run)
+        self.assertEqual(result.n_planned, 2)
+        self.assertEqual(client._sub.unstake.call_count, 2)
+        client._sub.proxy.assert_not_called()
+        self.assertEqual(result.n_succeeded, 2)
+        self.assertEqual(result.n_failed, 0)
+
+    def test_proxy_mode_wraps_via_proxy_pallet(self):
+        """use_proxy=True uses sub.proxy() with the SubtensorModule remove_stake call."""
+        from bt_trading_tools.network import unstake_all
+        client = self._make_client(stake_infos=[
+            MockStakeInfo(netuid=44, hotkey_ss58="5Ghk", stake=MockBalance(10.0, rao=int(10 * 1e9))),
+        ])
+        # Mock the imports unstake_all does in proxy branch
+        import sys
+        mock_pallets = MagicMock()
+        mock_module = AsyncMock()
+        mock_call = MagicMock()
+        mock_module.remove_stake = AsyncMock(return_value=mock_call)
+        mock_pallets.SubtensorModule.return_value = mock_module
+        mock_proxy_mod = MagicMock()
+
+        saved = {
+            k: sys.modules.get(k)
+            for k in ("bittensor", "bittensor.core", "bittensor.core.extrinsics",
+                      "bittensor.core.extrinsics.pallets",
+                      "bittensor.core.chain_data",
+                      "bittensor.core.chain_data.proxy")
+        }
+        sys.modules["bittensor"] = MagicMock()
+        sys.modules["bittensor.core"] = MagicMock()
+        sys.modules["bittensor.core.extrinsics"] = MagicMock()
+        sys.modules["bittensor.core.extrinsics.pallets"] = mock_pallets
+        sys.modules["bittensor.core.chain_data"] = MagicMock()
+        sys.modules["bittensor.core.chain_data.proxy"] = mock_proxy_mod
+        try:
+            mock_wallet = MagicMock()
+            result = asyncio.run(unstake_all(
+                client, coldkey_ss58="5GprincipalLedger",
+                wallet=mock_wallet, dry_run=False, use_proxy=True,
+                inter_unstake_delay_s=0.0,
+            ))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        # sub.unstake should NOT be called — proxy mode wraps via proxy()
+        client._sub.unstake.assert_not_called()
+        client._sub.proxy.assert_called_once()
+        proxy_kwargs = client._sub.proxy.call_args.kwargs
+        self.assertEqual(proxy_kwargs["real_account_ss58"], "5GprincipalLedger")
+        self.assertEqual(proxy_kwargs["wallet"], mock_wallet)
+        self.assertEqual(proxy_kwargs["call"], mock_call)
+        self.assertEqual(result.n_succeeded, 1)
+
+    def test_partial_failure_aggregates_correctly(self):
+        """One unstake fails, others succeed; counters are right."""
+        from bt_trading_tools.network import unstake_all
+
+        # Side effect: succeed for first call, raise on second
+        call_count = {"n": 0}
+        async def _flaky_unstake(**kw):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("flaky chain RPC")
+            return MockExtrinsicResponse(True)
+
+        client = SubtensorClient()
+        sub = AsyncMock()
+        sub.get_stake_info_for_coldkey = AsyncMock(return_value=[
+            MockStakeInfo(netuid=44, hotkey_ss58="5Ghk_a", stake=MockBalance(10.0, rao=int(10 * 1e9))),
+            MockStakeInfo(netuid=64, hotkey_ss58="5Ghk_b", stake=MockBalance(20.0, rao=int(20 * 1e9))),
+            MockStakeInfo(netuid=99, hotkey_ss58="5Ghk_c", stake=MockBalance(30.0, rao=int(30 * 1e9))),
+        ])
+        sub.unstake = AsyncMock(side_effect=_flaky_unstake)
+        sub.close = AsyncMock()
+        client._sub = sub
+
+        import sys
+        mock_bt = MagicMock()
+        mock_bt.Balance.from_tao.side_effect = lambda x: MockBalance(tao=float(x), rao=int(float(x) * 1e9))
+        saved = sys.modules.get("bittensor")
+        sys.modules["bittensor"] = mock_bt
+        try:
+            result = asyncio.run(unstake_all(
+                client, coldkey_ss58="5Gprincipal",
+                wallet=MagicMock(), dry_run=False,
+                inter_unstake_delay_s=0.0,
+            ))
+        finally:
+            if saved is None:
+                sys.modules.pop("bittensor", None)
+            else:
+                sys.modules["bittensor"] = saved
+        self.assertEqual(result.n_planned, 3)
+        self.assertEqual(result.n_succeeded, 2)
+        self.assertEqual(result.n_failed, 1)
+        # Failure record should carry the error string
+        failed = [r for r in result.results if not r.success]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("flaky", failed[0].error)
+
+
 if __name__ == "__main__":
     unittest.main()

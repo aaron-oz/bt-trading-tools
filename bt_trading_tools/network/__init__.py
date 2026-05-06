@@ -9,7 +9,17 @@ Provides:
 
 from bt_trading_tools.network.client import SubtensorClient
 from bt_trading_tools.network.executor import FEE_RESERVE_TAO, TradeExecutor, TradeResult
-from bt_trading_tools.network.wallet import ProxyWalletManager, WalletManager
+from bt_trading_tools.network.wallet import (
+    ProxyWalletManager,
+    UnstakeAllResult,
+    UnstakePlanItem,
+    UnstakeResult,
+    WalletManager,
+    WalletPosition,
+    WalletValuation,
+    unstake_all,
+    valuate_wallet,
+)
 
 __all__ = [
     "FEE_RESERVE_TAO",
@@ -17,5 +27,12 @@ __all__ = [
     "SubtensorClient",
     "TradeExecutor",
     "TradeResult",
+    "UnstakeAllResult",
+    "UnstakePlanItem",
+    "UnstakeResult",
     "WalletManager",
+    "WalletPosition",
+    "WalletValuation",
+    "unstake_all",
+    "valuate_wallet",
 ]
