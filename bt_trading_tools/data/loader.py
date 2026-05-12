@@ -28,6 +28,50 @@ from ..utils.lifecycle import detect_lifecycle_boundaries
 TAOFLOW_DATE = pd.Timestamp("2025-11-04", tz="UTC")
 
 
+def read_table(csv_path, **csv_kwargs) -> pd.DataFrame:
+    """Read tabular data, preferring Parquet over CSV.
+
+    Lookup order:
+      1. ``<csv_path>`` with extension swapped to ``.parquet`` (same dir)
+      2. ``<csv_path.parent.parent>/<csv_path.parent.name>_parquet/<stem>.parquet``
+         — i.e. a sibling ``X_parquet/`` dir alongside an ``X/`` CSV dir.
+         Matches the layout of ``data/taostats/`` (CSVs) and
+         ``data/taostats_parquet/`` (Parquet) during the migration.
+      3. ``<csv_path>`` as CSV with ``**csv_kwargs`` (e.g. ``low_memory=False``).
+         Parquet reads ignore CSV-only kwargs.
+    """
+    csv_path = Path(csv_path)
+    candidates = [
+        csv_path.with_suffix(".parquet"),
+        csv_path.parent.parent / f"{csv_path.parent.name}_parquet" / f"{csv_path.stem}.parquet",
+    ]
+    for p in candidates:
+        if p.exists():
+            return pd.read_parquet(p)
+    return pd.read_csv(csv_path, **csv_kwargs)
+
+
+def parse_timestamp(s: pd.Series, naive: bool = False) -> pd.Series:
+    """Parse a timestamp column to datetime64.
+
+    Handles three input types uniformly:
+      - string (CSV input) → parse ISO8601 as UTC
+      - tz-naive datetime64 (Parquet w/o tz, the DuckDB default) → assume UTC
+      - tz-aware datetime64 → keep as-is
+
+    Returns tz-aware UTC datetime64 by default. Set ``naive=True`` to drop
+    the timezone (matches UnifiedDataLoader's internal convention).
+    """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        if s.dt.tz is None:
+            s = s.dt.tz_localize("UTC")
+    else:
+        s = pd.to_datetime(s, format="ISO8601", utc=True)
+    if naive:
+        s = s.dt.tz_localize(None)
+    return s
+
+
 @dataclass
 class LoaderConfig:
     """Configuration for data loading."""
@@ -196,30 +240,25 @@ class UnifiedDataLoader:
     # ----------------------------------------------------------
 
     def _load_raw_dataframes(self, path: Path):
-        """Load CSV files into dataframes."""
+        """Load OHLCV / pool / subnet tables (Parquet preferred, CSV fallback)."""
         # OHLCV
         freq = self.cfg.freq
-        if freq == "5min":
-            ohlcv_file = path / "delegation_ohlcv_5m.csv"
-            if not ohlcv_file.exists():
-                raise FileNotFoundError(
-                    f"5-min OHLCV not found at {ohlcv_file}. "
-                    "Run scripts/build_5min_ohlcv.py first."
-                )
-        else:
-            ohlcv_file = path / "delegation_ohlcv_hourly.csv"
+        ohlcv_csv_name = "delegation_ohlcv_5m.csv" if freq == "5min" else "delegation_ohlcv_hourly.csv"
+        ohlcv_parquet = path / ohlcv_csv_name.replace(".csv", ".parquet")
+        ohlcv_csv = path / ohlcv_csv_name
+        if not ohlcv_parquet.exists() and not ohlcv_csv.exists():
+            hint = " Run scripts/build_5min_ohlcv.py first." if freq == "5min" else ""
+            raise FileNotFoundError(
+                f"OHLCV not found: tried {ohlcv_parquet} and {ohlcv_csv}.{hint}"
+            )
 
-        ohlcv = pd.read_csv(ohlcv_file)
-        ohlcv["time"] = pd.to_datetime(
-            ohlcv["time"], format="ISO8601", utc=True
-        ).dt.tz_localize(None)
+        ohlcv = read_table(path / ohlcv_csv_name)
+        ohlcv["time"] = parse_timestamp(ohlcv["time"], naive=True)
         ohlcv["netuid"] = ohlcv["netuid"].astype(int)
 
         # Pool history
-        pool = pd.read_csv(path / "pool_history.csv", low_memory=False)
-        pool["timestamp"] = pd.to_datetime(
-            pool["timestamp"], format="ISO8601", utc=True
-        ).dt.tz_localize(None)
+        pool = read_table(path / "pool_history.csv", low_memory=False)
+        pool["timestamp"] = parse_timestamp(pool["timestamp"], naive=True)
         pool["netuid"] = pool["netuid"].astype(int)
         # Derived columns (rao → TAO/tokens)
         pool["tao_in"] = pool["total_tao"].astype(float) / 1e9
@@ -244,10 +283,8 @@ class UnifiedDataLoader:
             ohlcv = ohlcv[~ohlcv["netuid"].isin(always_startup)]
 
         # Subnet history
-        sh = pd.read_csv(path / "subnet_history.csv")
-        sh["timestamp"] = pd.to_datetime(
-            sh["timestamp"], format="ISO8601", utc=True
-        ).dt.tz_localize(None)
+        sh = read_table(path / "subnet_history.csv")
+        sh["timestamp"] = parse_timestamp(sh["timestamp"], naive=True)
         sh["netuid"] = sh["netuid"].astype(int)
         sh["emission"] = sh["emission"].fillna(0).astype(float)
         sh["tempo"] = sh["tempo"].fillna(360).astype(float).clip(lower=1)
@@ -482,16 +519,13 @@ class UnifiedDataLoader:
     # ----------------------------------------------------------
 
     def _load_tao_usd(self, path: Path, data: DataArrays):
-        """Load TAO/USD price, trying 15-min tao_price.csv first, hourly fallback."""
+        """Load TAO/USD price, trying 15-min tao_price first, hourly fallback. Parquet preferred."""
         ts_df = pd.DataFrame({"time": data.timestamps})
 
-        # Primary: tao_price.csv (15-min resolution)
-        tao_path = path / "tao_price.csv"
-        if tao_path.exists():
-            tao = pd.read_csv(tao_path)
-            tao["timestamp"] = pd.to_datetime(
-                tao["timestamp"], format="ISO8601", utc=True
-            ).dt.tz_localize(None)
+        # Primary: tao_price (15-min resolution)
+        if (path / "tao_price.parquet").exists() or (path / "tao_price.csv").exists():
+            tao = read_table(path / "tao_price.csv")
+            tao["timestamp"] = parse_timestamp(tao["timestamp"], naive=True)
             tao = tao.sort_values("timestamp")
 
             m = pd.merge_asof(
@@ -504,13 +538,10 @@ class UnifiedDataLoader:
             data.tao_usd_market_cap = m["market_cap"].ffill().fillna(0).values.astype(np.float64)
             return
 
-        # Fallback: tao_ohlc_hourly.csv
-        hourly_path = path / "tao_ohlc_hourly.csv"
-        if hourly_path.exists():
-            tao = pd.read_csv(hourly_path)
-            tao["timestamp"] = pd.to_datetime(
-                tao["timestamp"], format="ISO8601", utc=True
-            ).dt.tz_localize(None)
+        # Fallback: tao_ohlc_hourly
+        if (path / "tao_ohlc_hourly.parquet").exists() or (path / "tao_ohlc_hourly.csv").exists():
+            tao = read_table(path / "tao_ohlc_hourly.csv")
+            tao["timestamp"] = parse_timestamp(tao["timestamp"], naive=True)
             tao = tao.sort_values("timestamp")
 
             m = pd.merge_asof(
