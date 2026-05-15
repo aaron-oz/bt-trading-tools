@@ -607,6 +607,37 @@ class EmpiricalYieldProvider:
 
 # ── Default model factory ─────────────────────────────────────────────
 
+def _validator_cache_fallback_paths() -> tuple[str, ...]:
+    """Fallback paths searched (in order) when VALIDATOR_CACHE_PATH env is
+    unset. First existing file wins. Production VPS first; local-user and
+    research-snapshot paths exist for dev / backtest sessions where the
+    operator has copied the validator cache out of bot-vps for analysis.
+    """
+    from pathlib import Path
+    return (
+        "/root/.validator_selection/best_validators.json",
+        str(Path.home() / ".validator_selection" / "best_validators.json"),
+        "/tmp/autobot_live_data/best_validators.json",
+    )
+
+
+def _resolve_validator_cache_path():
+    """Return the first existing validator-cache path from env → fallback list,
+    or None if none exist. Returns ``pathlib.Path`` or ``None``.
+    """
+    import os
+    from pathlib import Path
+    cache_path_env = os.environ.get("VALIDATOR_CACHE_PATH")
+    if cache_path_env:
+        p = Path(cache_path_env)
+        return p if p.exists() else None
+    for candidate in _validator_cache_fallback_paths():
+        p = Path(candidate)
+        if p.exists():
+            return p
+    return None
+
+
 def build_default_yield_model() -> "AlphaYieldModel":
     """Construct an ``AlphaYieldModel`` with an env-driven cascade.
 
@@ -618,12 +649,18 @@ def build_default_yield_model() -> "AlphaYieldModel":
 
     Configuration:
 
-        VALIDATOR_CACHE_PATH → enables ValidatorCacheYieldProvider (default
-                               /root/.validator_selection/best_validators.json
-                               if that file exists)
+        VALIDATOR_CACHE_PATH → enables ValidatorCacheYieldProvider (explicit override)
         TAOSTATS_API_KEY    → enables TaostatsYieldProvider (live API)
         BT_NETWORK          → enables ChainYieldProvider (live chain RPC)
         TAOSTATS_DATA_DIR   → enables EmpiricalYieldProvider (historical CSV)
+
+    Validator-cache path fallback search order (when VALIDATOR_CACHE_PATH
+    env is unset; first existing file wins):
+      1. /root/.validator_selection/best_validators.json (production VPS)
+      2. ~/.validator_selection/best_validators.json (local dev)
+      3. /tmp/autobot_live_data/best_validators.json (research snapshot path
+         used by Phase 0 autobot calibration; convention for paper-trading
+         snapshots pulled from bot-vps)
 
     Cascade order: validator-cache (sub-ms, daily-fresh) > live taostats >
     live chain > historical CSV > built-in zero fallback. The validator
@@ -633,8 +670,9 @@ def build_default_yield_model() -> "AlphaYieldModel":
 
     This function is the canonical default for both ``PaperBotBase`` and
     ``BacktestEngine``. Production paper bots have all three env vars
-    set in their systemd units, so they get full live yield. Backtests
-    that set ``TAOSTATS_DATA_DIR`` get historical yield from the CSV.
+    set in their systemd units, so they get full live yield. Research
+    sessions on dev / laptop typically get the validator cache via the
+    fallback search above (one of those paths is usually present).
 
     Returns:
         ``AlphaYieldModel`` with a ``CascadingYieldProvider`` whose tier
@@ -646,15 +684,10 @@ def build_default_yield_model() -> "AlphaYieldModel":
 
     providers: list[YieldRateProvider] = []
 
-    # Validator-selection cache first: sub-ms per-netuid lookup, daily-
-    # fresh. Only attached when the file actually exists (default VPS path
-    # or env-overridden), so dev machines without that file fall through to
-    # live providers naturally.
-    cache_path_env = os.environ.get("VALIDATOR_CACHE_PATH")
-    cache_path = Path(
-        cache_path_env or ValidatorCacheYieldProvider.DEFAULT_CACHE_PATH
-    )
-    if cache_path.exists():
+    # Validator-selection cache: sub-ms per-netuid lookup, daily-fresh.
+    # Resolved via env override OR fallback paths. None when no cache present.
+    cache_path = _resolve_validator_cache_path()
+    if cache_path is not None:
         providers.append(ValidatorCacheYieldProvider(cache_path=str(cache_path)))
 
     # Taostats live — fast-fails when no API key is set, so this is safe in
