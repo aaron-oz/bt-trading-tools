@@ -9,6 +9,8 @@ dependencies = [
     "pyyaml",
     "scipy",
     "pydantic>=2.0",
+    "requests",
+    "python-dotenv",
 ]
 
 [tool.setuptools.packages.find]
