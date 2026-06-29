@@ -516,26 +516,43 @@ class EmpiricalYieldProvider:
     unreachable. Useful as a deterministic default for backtests
     against historical data.
 
-    Derivation (from ``docs/data-dictionary.md`` §"Data Notes"):
+    Derivation (Bittensor participant-alpha distribution, see
+    ``docs/bittensor-mechanics-primer.md`` §6 — NOT the TAO-denominated
+    ``emission`` column):
 
-        subnet_history.csv ``emission``      = rao per tempo
-        pool_history.csv ``alpha_staked``    = rao (alpha outside pool)
-        blocks_per_day                       = 7200
-        tempos_per_day                       = blocks_per_day / tempo
-        daily_alpha_emission (rao)           = emission × tempos_per_day
-        daily_to_delegators (rao)            = daily_alpha_emission × DELEGATOR_SHARE
-        rate_per_day (dimensionless)         = daily_to_delegators / alpha_staked
+        participant_alpha/block = PARTICIPANT_ALPHA_PER_BLOCK   (0.5 post-halving)
+        daily_participant_alpha = participant_alpha/block × BLOCKS_PER_DAY
+        subnet_staker_alpha/day = daily_participant_alpha
+                                  × VALIDATOR_STAKER_SHARE       (0.41)
+                                  × (1 − root_prop)              (per-subnet, pool_history)
+        delegator_alpha/day     = subnet_staker_alpha/day × DELEGATOR_SHARE (0.82)
+        rate_per_day            = delegator_alpha/day ÷ (alpha_staked_rao / 1e9)
 
-    Both numerator and denominator are in rao so units cancel.
-    ``DELEGATOR_SHARE = 0.82`` matches ``ChainYieldProvider`` — see
-    notes there.
+    Prior bug (fixed 2026-06): the formula used ``subnet_history.emission``,
+    which is the subnet's *TAO* Taoflow share (rao of TAO), as if it were
+    alpha emission, and divided by alpha-rao staked. The units did not
+    cancel and the result was ~0 yield for every subnet (~1000× too low);
+    a separate ISO8601 date-parse crash sent the whole cascade to the zero
+    fallback. Both are corrected here.
+
+    CAVEAT: ``PARTICIPANT_ALPHA_PER_BLOCK`` is fixed at the post-halving
+    0.5 alpha/block default. Subnets that have not yet halved emit 1.0
+    alpha/block, so this UNDERSTATES their yield by up to 2×. The taostats
+    CSVs carry no per-subnet alpha-emission or halving state; for
+    per-subnet-accurate emission use ``ChainYieldProvider`` (reads
+    ``alpha_out_emission`` from chain DynamicInfo) or a live APY source
+    (``ValidatorCacheYieldProvider`` / ``TaostatsYieldProvider``). The
+    rate is also a trailing-window mean (time-invariant within a backtest),
+    so it does not capture a subnet's yield changing over a position's hold.
 
     Files resolved via the ``data_dir`` constructor arg; override for
     tests or alternate layouts.
     """
     source = AlphaYieldSource.EMPIRICAL
 
-    DELEGATOR_SHARE: float = 0.82
+    DELEGATOR_SHARE: float = 0.82            # 1 − ≤18% validator commission (§6)
+    VALIDATOR_STAKER_SHARE: float = 0.41     # validator+staker share of participant alpha (§6)
+    PARTICIPANT_ALPHA_PER_BLOCK: float = 0.5  # post-halving default (see CAVEAT)
     BLOCKS_PER_DAY: float = 7200.0
 
     def __init__(
@@ -564,42 +581,46 @@ class EmpiricalYieldProvider:
 
         import pandas as pd
 
-        subnet_path = os.path.join(self._data_dir, "subnet_history.csv")
         pool_path = os.path.join(self._data_dir, "pool_history.csv")
+        pool = pd.read_csv(pool_path, low_memory=False)
 
-        subnet = pd.read_csv(subnet_path)
-        pool = pd.read_csv(pool_path)
+        # Normalize date column. Parse with ISO8601 explicitly: the CSVs mix
+        # microsecond and whole-second timestamps, which crashes a
+        # format-inferred parse (and previously sent the cascade to zero).
+        if "date" in pool.columns:
+            pool["date"] = pd.to_datetime(pool["date"], format="ISO8601", utc=True)
+        elif "timestamp" in pool.columns:
+            pool["date"] = pd.to_datetime(pool["timestamp"], format="ISO8601", utc=True)
 
-        # Normalize date columns
-        for df in (subnet, pool):
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-            elif "timestamp" in df.columns:
-                df["date"] = pd.to_datetime(df["timestamp"])
+        cutoff = pool["date"].max() - pd.Timedelta(days=self._window_days)
+        recent = pool[pool["date"] >= cutoff]
 
-        cutoff = subnet["date"].max() - pd.Timedelta(days=self._window_days)
-        recent_subnet = subnet[subnet["date"] >= cutoff]
-        recent_pool = pool[pool["date"] >= cutoff]
-
-        tempo = (
-            recent_subnet["tempo"].mean()
-            if "tempo" in recent_subnet.columns
-            else 360.0
+        agg_alpha_staked = recent.groupby("netuid")["alpha_staked"].mean()
+        agg_root_prop = (
+            recent.groupby("netuid")["root_prop"].mean()
+            if "root_prop" in recent.columns
+            else None
         )
-        tempos_per_day = self.BLOCKS_PER_DAY / max(float(tempo), 1.0)
 
-        agg_emission = recent_subnet.groupby("netuid")["emission"].mean()
-        agg_alpha_staked = recent_pool.groupby("netuid")["alpha_staked"].mean()
+        daily_participant_alpha = self.PARTICIPANT_ALPHA_PER_BLOCK * self.BLOCKS_PER_DAY
 
         out: dict[int, float] = {}
-        for netuid, em_rao_per_tempo in agg_emission.items():
-            alpha_staked_rao = agg_alpha_staked.get(netuid)
+        for netuid, alpha_staked_rao in agg_alpha_staked.items():
             if alpha_staked_rao is None or alpha_staked_rao <= 0:
                 continue
-            daily_alpha = em_rao_per_tempo * tempos_per_day
-            daily_to_delegators = daily_alpha * self.DELEGATOR_SHARE
-            # Both sides rao → dimensionless rate_per_day.
-            out[int(netuid)] = float(daily_to_delegators / alpha_staked_rao)
+            root_prop = (
+                float(agg_root_prop.get(netuid, 0.0)) if agg_root_prop is not None else 0.0
+            )
+            if not (0.0 <= root_prop <= 1.0):
+                root_prop = 0.0
+            delegator_alpha_day = (
+                daily_participant_alpha
+                * self.VALIDATOR_STAKER_SHARE
+                * (1.0 - root_prop)
+                * self.DELEGATOR_SHARE
+            )
+            alpha_staked_tokens = float(alpha_staked_rao) / 1e9
+            out[int(netuid)] = delegator_alpha_day / alpha_staked_tokens
 
         self._cache = out
         self._loaded_at = now
