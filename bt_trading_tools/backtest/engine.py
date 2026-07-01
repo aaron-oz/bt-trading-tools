@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from bt_trading_tools.amm import amm_buy, amm_sell, slippage_pct, spot_price
@@ -363,9 +364,19 @@ class BacktestEngine:
         # Drop buys for subnets flagged by slow_drain / fast_rug / A>S.
         # Sells are NEVER blocked — exits must always be allowed. Same
         # convention as PaperBotBase._filter_unsafe_actions.
+        #
+        # POINT-IN-TIME: pass the current tick timestamp as `as_of` so the
+        # checker evaluates safety against pool state available AT the
+        # simulated date, not the end of the dataset. Without this, the
+        # checker defaults to `df.index.max()` (the latest row in the whole
+        # pool_history), which is lookahead: appending future data changes the
+        # safety verdict on historical ticks and silently drifts a fixed
+        # window's results. Live/paper bots correctly leave as_of=None (they
+        # want the latest real snapshot); only the backtest must pin it.
         if self.pool_safety_checker is not None:
             try:
-                flags = self.pool_safety_checker.check(order.netuid)
+                as_of = datetime.fromtimestamp(tick.timestamp, tz=timezone.utc)
+                flags = self.pool_safety_checker.check(order.netuid, as_of=as_of)
                 if flags is not None and getattr(flags, "any_unsafe", False):
                     failed = {
                         "netuid": order.netuid,
