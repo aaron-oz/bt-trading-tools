@@ -81,11 +81,33 @@ class CascadingYieldProvider:
     Final tier is a built-in zero-rate fallback (``rate_per_day=0.0``,
     source=FALLBACK) so yield accrual becomes a no-op rather than
     crashing the paper bot.
+
+    Instrumentation (added 2026-07-09): every call to
+    ``fetch_rate_with_source`` updates a per-tier hit counter accessible via
+    ``tier_hits()``. The 2026-07-08 yield audit measured 4-11 per-bot silent
+    fall-throughs to zero per quarter using log-mtime heuristics; this
+    counter makes future audits a `provider.tier_hits()` call instead of
+    log-mining. Also tracks per-tier failure counts + last error message.
     """
     source = AlphaYieldSource.FALLBACK   # only used if every tier fails
 
     def __init__(self, providers: list[YieldRateProvider]):
         self._providers = list(providers)
+        # {AlphaYieldSource: int} — one bucket per real tier + FALLBACK.
+        # Bucket keys are the sources exposed by the providers; add the
+        # fallback bucket explicitly since it isn't a "provider" object.
+        self._tier_hits: dict[AlphaYieldSource, int] = {
+            p.source: 0 for p in self._providers
+        }
+        self._tier_hits[AlphaYieldSource.FALLBACK] = 0
+        self._tier_failures: dict[AlphaYieldSource, int] = {
+            p.source: 0 for p in self._providers
+        }
+        # Last error per tier, useful for post-mortem after a spike in
+        # failures. Keep small (just the type + repr, not full traceback).
+        self._tier_last_error: dict[AlphaYieldSource, Optional[str]] = {
+            p.source: None for p in self._providers
+        }
 
     def fetch_rate_with_source(self, netuid: int) -> tuple[float, AlphaYieldSource, Optional[str]]:
         """Return (rate, source, error). Never raises."""
@@ -95,14 +117,84 @@ class CascadingYieldProvider:
                 rate = float(p.fetch_rate(netuid))
                 if rate < 0 or not _finite(rate):
                     raise ValueError(f"invalid rate {rate!r} from {p.source}")
+                self._tier_hits[p.source] = self._tier_hits.get(p.source, 0) + 1
                 return rate, p.source, None
             except Exception as e:
                 last_error = f"{p.source}:{type(e).__name__}:{e}"
+                self._tier_failures[p.source] = self._tier_failures.get(p.source, 0) + 1
+                self._tier_last_error[p.source] = f"{type(e).__name__}: {e!s:.200}"
                 logger.debug(
                     "YieldProvider %s failed for netuid=%d: %s",
                     p.source, netuid, e,
                 )
+        self._tier_hits[AlphaYieldSource.FALLBACK] = (
+            self._tier_hits.get(AlphaYieldSource.FALLBACK, 0) + 1
+        )
         return 0.0, AlphaYieldSource.FALLBACK, last_error
+
+    # ── Instrumentation accessors (added 2026-07-09) ────────────────────
+
+    def tier_hits(self) -> dict[AlphaYieldSource, int]:
+        """Return a copy of the per-tier hit counter.
+
+        A "hit" = the tier successfully returned a rate. The FALLBACK
+        bucket counts calls where every real tier failed (silent zero
+        events — the case the 2026-07-08 audit flagged). Copies so
+        callers can't mutate internal state.
+        """
+        return dict(self._tier_hits)
+
+    def tier_failures(self) -> dict[AlphaYieldSource, int]:
+        """Return a copy of the per-tier failure counter.
+
+        A "failure" = the tier raised or returned an invalid rate. Same
+        call can produce a failure for tier N (counted here) and a hit
+        for tier N+1 (counted in tier_hits) — the cascade tried multiple.
+        """
+        return dict(self._tier_failures)
+
+    def tier_last_error(self) -> dict[AlphaYieldSource, Optional[str]]:
+        """Return a copy of the last-error-per-tier map.
+
+        None means the tier has never failed since construction (or has
+        never been called). Errors are truncated to ~200 chars so a
+        blown-up traceback doesn't sit in memory forever.
+        """
+        return dict(self._tier_last_error)
+
+    def instrumentation_snapshot(self) -> dict:
+        """Combined single-object snapshot for logging / diagnostic dumps.
+
+        Shape:
+            {
+              "hits":     {"validator_cache": 12345, "taostats": 42, ...},
+              "failures": {"validator_cache": 3, "taostats": 8, ...},
+              "last_error": {"validator_cache": null, "taostats": "...", ...},
+              "total_calls": 12345,
+              "fallback_rate": 0.0001,
+            }
+        Fallback rate = FALLBACK hits / total calls; the audit-relevant
+        metric is fallback_rate stays close to zero.
+        """
+        hits = self.tier_hits()
+        total = sum(hits.values())
+        fallback = hits.get(AlphaYieldSource.FALLBACK, 0)
+        return {
+            "hits": {s.value: n for s, n in hits.items()},
+            "failures": {s.value: n for s, n in self.tier_failures().items()},
+            "last_error": {s.value: e for s, e in self.tier_last_error().items()},
+            "total_calls": total,
+            "fallback_rate": (fallback / total) if total else 0.0,
+        }
+
+    def reset_instrumentation(self) -> None:
+        """Zero every counter + clear last-error. Useful for windowed audits."""
+        for k in list(self._tier_hits.keys()):
+            self._tier_hits[k] = 0
+        for k in list(self._tier_failures.keys()):
+            self._tier_failures[k] = 0
+        for k in list(self._tier_last_error.keys()):
+            self._tier_last_error[k] = None
 
 
 # ── AlphaYieldModel ───────────────────────────────────────────────────
