@@ -161,6 +161,7 @@ Snapshot of the three meta-agent state flags that were in effect when the bot de
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `meta_circuit_breaker_active` | `bool` | yes (default `false`) | Meta-agent's `circuit_breaker` flag at the time the bot read allocation.json. `true` means at least one circuit breaker was tripped (see `allocation_schema.md` for reasons vocabulary). |
+| `meta_circuit_breaker_reasons` | `list[str]` | yes (default `[]`) | Mirror of `allocation.json:global.circuit_breaker_reasons` at trade time — the reason codes for why the breaker fired. Empty when `meta_circuit_breaker_active` is `false`; typically 1-3 entries when true. Added 2026-07-09; empty by default on records that predate the field. |
 | `meta_novelty_gate_active` | `bool` | yes (default `false`) | Mahalanobis novelty gate active. Bots that respect the gate should halt new entries while `true`. |
 | `meta_stale_inputs` | `bool` | yes (default `false`) | Meta-agent detected stale inputs on its last evaluate. Downstream audit: did this bot still honor halt/sizing while inputs were stale? |
 
@@ -212,6 +213,7 @@ In addition to §3 common fields (bot-wide — NOT §3.1 subnet fields):
 | `realized_pnl_to_date_tao` | `float` | yes | Cumulative realized P&L since the bot's first snapshot. May be negative. |
 | `open_positions_count` | `int` (≥ 0) | yes | Number of held positions at tick time. |
 | `meta_circuit_breaker_active` | `bool` | yes (v2; default `false`) | Same semantics as §4.8 — snapshot of meta-agent's `circuit_breaker` at tick time. |
+| `meta_circuit_breaker_reasons` | `list[str]` | yes (default `[]`) | Same semantics as §4.8. Added 2026-07-09. |
 | `meta_novelty_gate_active` | `bool` | yes (v2; default `false`) | Same semantics as §4.8. |
 | `meta_stale_inputs` | `bool` | yes (v2; default `false`) | Same semantics as §4.8. |
 

@@ -14,6 +14,12 @@ v2 (2026-04-23) promoted from extras to canonical on TradeRecord:
     meta-agent booleans (`meta_circuit_breaker_active`,
     `meta_novelty_gate_active`, `meta_stale_inputs`). The same three
     booleans are added to PortfolioSnapshot. MTMSample is unchanged.
+
+v2 additive (2026-07-09): `meta_circuit_breaker_reasons: list[str]` added
+    to TradeRecord and PortfolioSnapshot so a CQI audit can see WHY the
+    breaker fired at emission time (not just that it did). Defaults to
+    the empty list, so pre-2026-07-09 records that omit the field still
+    parse cleanly. No SCHEMA_VERSION bump.
 """
 from __future__ import annotations
 
@@ -152,6 +158,10 @@ class TradeRecord(_SubnetRecord):
     meta_circuit_breaker_active: bool = False
     meta_novelty_gate_active: bool = False
     meta_stale_inputs: bool = False
+    # v2 additive (2026-07-09): breaker reason list at emission time.
+    # Empty when the breaker was inactive; also empty for pre-2026-07-09 records
+    # that never carried the field. See trade_log_schema.md §4.7.
+    meta_circuit_breaker_reasons: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_requested_pairing(self):
@@ -253,6 +263,9 @@ class PortfolioSnapshot(_RootRecord):
     meta_circuit_breaker_active: bool = False
     meta_novelty_gate_active: bool = False
     meta_stale_inputs: bool = False
+    # v2 additive (2026-07-09): mirrored from TradeRecord for the same reason
+    # — the snapshot is what the CQI dashboard aggregates per tick.
+    meta_circuit_breaker_reasons: list[str] = Field(default_factory=list)
 
 
 Record = Annotated[
