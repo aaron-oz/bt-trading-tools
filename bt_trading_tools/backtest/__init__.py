@@ -16,6 +16,12 @@ Usage::
 """
 
 from bt_trading_tools.backtest.engine import BacktestEngine, BacktestResults
+from bt_trading_tools.backtest.panel import (
+    ScheduledBasketStrategy,
+    panel_forward_returns,
+    run_basket_window,
+    slice_ticks,
+)
 from bt_trading_tools.backtest.types import (
     Order,
     Position,
@@ -53,4 +59,8 @@ __all__ = [
     "PurgedWalkForwardCV",
     "CVFold",
     "ScheduledStrategy",
+    "ScheduledBasketStrategy",
+    "panel_forward_returns",
+    "run_basket_window",
+    "slice_ticks",
 ]
