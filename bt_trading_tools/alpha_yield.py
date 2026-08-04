@@ -923,3 +923,59 @@ def _first_record(payload) -> dict:
             raise ValueError("empty taostats list")
         return payload[0]
     raise ValueError(f"unexpected taostats payload shape: {type(payload)}")
+
+
+class HistoricalSubnetYieldModel:
+    """Engine-compatible yield model backed by a historical per-subnet APY CSV.
+
+    Promoted 2026-08-04 from bots/yield-carry-bot/research/run_backtest_v2.py
+    (generic infrastructure; the CSV schema, not the class, carries any
+    research specifics). Implements the duck-typed
+    ``accrued_yield(netuid, alpha_qty, entry_time, now)`` interface that
+    ``BacktestEngine._accrued_yield`` calls, with a time-VARYING daily rate —
+    unlike the trailing-window-constant providers above, this reflects each
+    day's actual rate over a backtest window.
+
+    CSV schema: columns ``netuid``, ``date`` (parseable, UTC), ``gross_apy``
+    (annualized). Rows with missing/negative APY are dropped.
+
+    Args:
+        csv_path: path to the per-subnet daily yield CSV.
+        floor_date: optional ISO date; rows strictly before it are dropped
+            (e.g. a tokenomics-regime activation date). Because accrual is a
+            cum-rate difference, dropping earlier rows does not change
+            results for trades after the floor; it makes the guarantee
+            literal.
+    """
+
+    def __init__(self, csv_path, floor_date: "str | None" = None):
+        import pandas as _pd
+
+        df = _pd.read_csv(csv_path)
+        df["date"] = _pd.to_datetime(df["date"], utc=True)
+        df = df[df["gross_apy"].notna() & (df["gross_apy"] >= 0)]
+        if floor_date is not None:
+            df = df[df["date"] >= _pd.Timestamp(floor_date, tz="UTC")]
+        df["daily_rate"] = df["gross_apy"] / 365.0
+        df = df.sort_values(["netuid", "date"]).reset_index(drop=True)
+        df["cum_rate"] = df.groupby("netuid")["daily_rate"].cumsum()
+        self._lookup = {
+            int(netuid): grp.set_index("date")["cum_rate"]
+            for netuid, grp in df.groupby("netuid")
+        }
+
+    def _cum_at(self, series, ts: float) -> float:
+        import pandas as _pd
+
+        t = _pd.Timestamp(ts, unit="s", tz="UTC")
+        idx = series.index.searchsorted(t, side="right") - 1
+        if idx < 0:
+            return 0.0
+        return float(series.iloc[idx])
+
+    def accrued_yield(self, netuid: int, alpha_qty: float, entry_time, now) -> float:
+        series = self._lookup.get(int(netuid))
+        if series is None or alpha_qty <= 0:
+            return 0.0
+        rate = self._cum_at(series, float(now)) - self._cum_at(series, float(entry_time))
+        return max(0.0, alpha_qty * rate)
