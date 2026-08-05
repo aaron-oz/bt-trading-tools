@@ -55,25 +55,28 @@ class PositionPnL:
 
 
 def compute_pnl(
-    source: TradeSource,
+    log_path: TradeSource,
     *,
     position_model: PositionModel,
     basis: PnLBasis = "fifo",
 ) -> dict[str, PositionPnL]:
     """Compute realized P&L per position_id from v1 trade records.
 
-    `source` is either a path to a v1 trade log or an iterable of already-loaded
-    v1 record dicts. The iterable form lets a caller run the canonical accounting
-    over records held elsewhere (a legacy store being migrated, an in-memory
-    slice) without first writing them to disk.
+    `log_path` is either a path to a v1 trade log or an iterable of
+    already-loaded v1 record dicts. The iterable form lets a caller run the
+    canonical accounting over records held elsewhere (a legacy store being
+    migrated, an in-memory slice) without first writing them to disk. The
+    parameter keeps its original name despite now accepting more than a path:
+    it is positional-or-keyword in a package intended for open-sourcing, so
+    renaming it would break callers passing `log_path=` for no functional gain.
 
     `basis` only matters for inventory model; pair/level/cycle always use FIFO
     within the position (which collapses to trivial matching for pair).
     """
-    if isinstance(source, (str, Path)):
-        records: Iterable[dict] = iter_trade_log(source)
+    if isinstance(log_path, (str, Path)):
+        records: Iterable[dict] = iter_trade_log(log_path)
     else:
-        records = source
+        records = log_path
 
     groups: dict[str, list[dict]] = defaultdict(list)
     for rec in records:
