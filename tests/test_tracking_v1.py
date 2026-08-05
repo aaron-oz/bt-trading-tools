@@ -354,5 +354,119 @@ class TestMetrics(unittest.TestCase):
         self.assertIsNotNone(s)
 
 
+class TestCostBasisRemaining(unittest.TestCase):
+    """`cost_basis_remaining_tao` / `avg_cost_tao_per_alpha`, and the in-memory
+    record source. These back breakeven and average-cost displays, which need
+    the basis still attached to the held alpha rather than the cumulative
+    `tao_invested` figure."""
+
+    @staticmethod
+    def _rec(side, tao, alpha, price, *, yield_accrued=None, netuid=10):
+        rec = {
+            "record_type": "trade", "schema_version": 2, "bot_id": "t",
+            "netuid": netuid, "is_paper": True,
+            "pool_tao": 10000.0, "pool_alpha": 2000000.0,
+            "side": side, "status": "executed",
+            "category": "entry" if side == "buy" else "exit",
+            "intent": "entry" if side == "buy" else "exit",
+            "position_id": f"sn{netuid}",
+            "tao_amount": tao, "alpha_amount": alpha, "executed_price": price,
+            "decision_pool_tao": 10000.0, "decision_pool_alpha": 2000000.0,
+            "execution_mode": "backtest",
+            "timestamp": f"2026-01-01T00:00:{len(side):02d}Z",
+        }
+        if yield_accrued is not None:
+            rec["alpha_yield_accrued"] = yield_accrued
+        return rec
+
+    def _pnl(self, recs, basis):
+        # Stable ordering: compute_pnl sorts by timestamp, so stamp increasing.
+        for i, r in enumerate(recs):
+            r["timestamp"] = f"2026-01-01T00:00:{i:02d}Z"
+        return compute_pnl(recs, position_model="inventory", basis=basis)["sn10"]
+
+    def test_accepts_iterable_of_records(self):
+        """compute_pnl takes loaded records, not only a log path."""
+        p = self._pnl([self._rec("buy", 1.0, 100.0, 0.01)], "avg_cost")
+        self.assertAlmostEqual(p.alpha_held, 100.0, places=6)
+        self.assertAlmostEqual(p.cost_basis_remaining_tao, 1.0, places=6)
+
+    def test_remaining_basis_drawn_down_by_sells_avg_cost(self):
+        recs = [
+            self._rec("buy", 1.0, 100.0, 0.01),
+            self._rec("buy", 3.0, 100.0, 0.03),   # avg cost 4.0/200 = 0.02
+            self._rec("sell", 1.0, 50.0, 0.02),   # releases 50 * 0.02 = 1.0 of basis
+        ]
+        p = self._pnl(recs, "avg_cost")
+        self.assertAlmostEqual(p.alpha_held, 150.0, places=6)
+        self.assertAlmostEqual(p.cost_basis_remaining_tao, 3.0, places=6)
+        self.assertAlmostEqual(p.avg_cost_tao_per_alpha, 0.02, places=8)
+        # tao_invested stays cumulative and is NOT drawn down.
+        self.assertAlmostEqual(p.tao_invested, 4.0, places=6)
+
+    def test_remaining_basis_fifo(self):
+        recs = [
+            self._rec("buy", 1.0, 100.0, 0.01),   # lot A: 0.01/alpha
+            self._rec("buy", 3.0, 100.0, 0.03),   # lot B: 0.03/alpha
+            self._rec("sell", 1.5, 100.0, 0.015),  # consumes all of lot A
+        ]
+        p = self._pnl(recs, "fifo")
+        self.assertAlmostEqual(p.alpha_held, 100.0, places=6)
+        self.assertAlmostEqual(p.cost_basis_remaining_tao, 3.0, places=6)
+        self.assertAlmostEqual(p.avg_cost_tao_per_alpha, 0.03, places=8)
+
+    def test_flat_position_has_zero_basis_and_zero_avg_cost(self):
+        recs = [
+            self._rec("buy", 1.0, 100.0, 0.01),
+            self._rec("sell", 1.2, 100.0, 0.012),
+        ]
+        for basis in ("avg_cost", "fifo"):
+            p = self._pnl(recs, basis)
+            self.assertAlmostEqual(p.alpha_held, 0.0, places=9, msg=basis)
+            self.assertAlmostEqual(p.cost_basis_remaining_tao, 0.0, places=9, msg=basis)
+            self.assertEqual(p.avg_cost_tao_per_alpha, 0.0, msg=basis)
+            self.assertFalse(p.is_open, msg=basis)
+
+    def test_oversell_does_not_corrupt_a_later_reentry(self):
+        """Regression: selling more alpha than was ever bought (staking yield
+        sold without an `alpha_yield_accrued` declaration) must not leave a
+        negative quantity that survives into the next entry.
+
+        This is the bagbot sn46 failure: 2680.01 alpha bought, 2992.60 sold in
+        April 2026, leaving -312.59 in a hand-rolled ledger. Three months later
+        a fresh 10 TAO entry was divided by the deficit-carrying quantity,
+        overstating average cost by 17% and showing a -14.2% loss on a position
+        opened minutes earlier at the prevailing price.
+        """
+        recs = [
+            self._rec("buy", 18.0, 2680.01, 0.006716),
+            self._rec("sell", 23.19, 2992.60, 0.007749),   # 312.59 more than bought
+            self._rec("buy", 5.0, 1081.86, 0.004624),      # re-entry, months later
+            self._rec("buy", 5.0, 1080.76, 0.004626),
+        ]
+        for basis in ("avg_cost", "fifo"):
+            p = self._pnl(recs, basis)
+            self.assertGreaterEqual(p.alpha_held, 0.0, msg=basis)
+            # Quantity is exactly the re-entry, with no deficit carried forward.
+            self.assertAlmostEqual(p.alpha_held, 2162.62, places=2, msg=basis)
+            self.assertAlmostEqual(p.cost_basis_remaining_tao, 10.0, places=6, msg=basis)
+            # Average cost is what was actually paid: 10.0 / 2162.62 = 0.00462402.
+            # The broken hand-rolled ledger reported 0.005405 here.
+            self.assertAlmostEqual(p.avg_cost_tao_per_alpha, 0.00462402, places=8, msg=basis)
+
+    def test_oversold_excess_is_credited_as_realized_profit(self):
+        """The un-declared yield alpha has no cost basis, so its proceeds are
+        pure realized profit rather than being silently dropped."""
+        recs = [
+            self._rec("buy", 1.0, 100.0, 0.01),
+            self._rec("sell", 1.5, 150.0, 0.01),   # 50 alpha of yield, zero basis
+        ]
+        for basis in ("avg_cost", "fifo"):
+            p = self._pnl(recs, basis)
+            # Received 1.5, released basis 1.0 → realized 0.5.
+            self.assertAlmostEqual(p.realized_tao, 0.5, places=6, msg=basis)
+            self.assertAlmostEqual(p.alpha_held, 0.0, places=9, msg=basis)
+
+
 if __name__ == "__main__":
     unittest.main()
