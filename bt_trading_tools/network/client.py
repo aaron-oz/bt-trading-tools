@@ -85,7 +85,12 @@ class SubtensorClient:
 
         for attempt in range(1, self.max_connect_retries + 1):
             try:
-                self._sub = await get_async_subtensor(self.network)
+                # Bounded: get_async_subtensor can block indefinitely when the
+                # endpoint accepts TCP but never completes the handshake
+                # (2026-08-15 fleet-wide hang -- see reconnect()).
+                self._sub = await asyncio.wait_for(
+                    get_async_subtensor(self.network), timeout=60.0,
+                )
                 logger.info(f"Connected to {self.network}")
                 return
             except (
@@ -108,16 +113,23 @@ class SubtensorClient:
         from bittensor.core.async_subtensor import get_async_subtensor
 
         for attempt in range(1, self.max_reconnect_retries + 1):
-            # Close existing connection
+            # Close existing connection. Bounded: close() on a dead websocket
+            # awaits a close handshake that never completes, and every await
+            # in this method runs OUTSIDE any caller-side wait_for (callers
+            # time out the read, then call reconnect() unbounded). This froze
+            # the whole fleet for 2.6 days on 2026-08-15: the RPC endpoint
+            # stalled, wait_for_block timed out, and every bot hung here.
             try:
                 if self._sub is not None:
-                    await self._sub.close()
+                    await asyncio.wait_for(self._sub.close(), timeout=10.0)
             except Exception:
                 pass
             self._sub = None
 
             try:
-                self._sub = await get_async_subtensor(self.network)
+                self._sub = await asyncio.wait_for(
+                    get_async_subtensor(self.network), timeout=60.0,
+                )
                 logger.info(f"Reconnected to {self.network} (attempt {attempt})")
                 return
             except Exception as e:
@@ -134,10 +146,10 @@ class SubtensorClient:
         )
 
     async def close(self) -> None:
-        """Close the connection."""
+        """Close the connection. Bounded -- see reconnect()."""
         if self._sub is not None:
             try:
-                await self._sub.close()
+                await asyncio.wait_for(self._sub.close(), timeout=10.0)
             except Exception:
                 pass
             self._sub = None
