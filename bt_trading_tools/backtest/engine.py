@@ -182,8 +182,20 @@ class BacktestEngine:
         # nobody traded between decision and execution, so price didn't change).
         # This avoids the need to forward-fill sparse data to block level.
         pending_orders: list[tuple[int, Order, SubnetTick | None]] = []
+        # Last-seen state per subnet, for the end-of-data force-close.
+        # Sparse data means a subnet can be absent from the final tick even
+        # though it traded recently; between transactions AMM pool state
+        # does not change, so the last-seen state IS ground truth (same
+        # principle as the delayed-order fallback below). Before 2026-09-10
+        # the force-close fell back to ENTRY price for absent subnets,
+        # silently neutralizing the trade (bug found via the bagbot
+        # crash-guard study: crashed subnets trade sparsely, so their
+        # losses were scored ~flat).
+        last_seen: dict[int, SubnetTick] = {}
 
         for tick_idx, tick in enumerate(ticks):
+            for _netuid, _st in tick.subnets.items():
+                last_seen[_netuid] = _st
             # ── Refresh pool-safety checker once per tick (clears its
             # per-subnet cache so subsequent check() calls see fresh data) ─
             if self.pool_safety_checker is not None:
@@ -267,6 +279,11 @@ class BacktestEngine:
             for netuid in list(positions.keys()):
                 pos = positions[netuid]
                 st = last_tick.subnets.get(netuid)
+                if st is not None:
+                    exit_source = "last_tick"
+                else:
+                    st = last_seen.get(netuid)
+                    exit_source = "last_seen" if st is not None else "entry_fallback"
                 accrued = self._accrued_yield(netuid, pos, last_tick.timestamp)
                 effective_alpha_qty = pos.alpha_qty + accrued
                 if st and st.tao_pool > 0 and st.alpha_pool > 0:
@@ -278,6 +295,9 @@ class BacktestEngine:
                     )
                     tao_received = tao_out - fee
                 else:
+                    # Only reachable if the subnet never appeared in any tick
+                    # (an open position implies at least the entry tick, so
+                    # this is a defensive branch) or its pools are zero.
                     price = st.price if st else pos.entry_price
                     tao_received = effective_alpha_qty * price
                     fee = 0.0
@@ -302,6 +322,7 @@ class BacktestEngine:
                     "fees": pos.entry_fees + fee,
                     "hold_seconds": last_tick.timestamp - pos.entry_time,
                     "reason": "end_of_data",
+                    "exit_source": exit_source,
                     "alpha_yield_accrued": accrued,
                     **fee_components,
                 }
