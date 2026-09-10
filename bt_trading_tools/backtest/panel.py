@@ -14,10 +14,13 @@ Design: each (entry_ts, horizon) window is one ``BacktestEngine.run`` over
 the tick slice [entry_ts, exit_ts]. A ``ScheduledBasketStrategy`` buys the
 basket at the first available tick per subnet and never sells; the engine's
 end-of-run force-close provides the exit with full sell-side friction and
-yield accrual, and its missing-subnet fallback (last-seen spot price, no
-slippage) matches the empirically observed dereg payout rule
-(T/alpha_staked ~= spot; SN103 observation 2026-08-03, see
-alpha-trading docs/bittensor-mechanics-primer.md § Deregistration).
+yield accrual, and its missing-subnet fallback (AMM sell against the
+last-seen pool state; ~= spot for clip-sized positions) approximates the
+empirically observed dereg payout rule (T/alpha_staked ~= spot; SN103
+observation 2026-08-03, see alpha-trading
+docs/bittensor-mechanics-primer.md § Deregistration). Before 2026-09-10
+the engine's fallback was ENTRY price (bug; see engine.py force-close),
+which neutralized trades on subnets absent from the final tick.
 Per-position outcomes are read from ``results.trades``.
 """
 from __future__ import annotations
@@ -137,6 +140,7 @@ def run_basket_window(
                 "fees": tr.get("fees", 0.0),
                 "alpha_yield_accrued": tr.get("alpha_yield_accrued", 0.0),
                 "exit_reason": tr.get("reason", ""),
+                "exit_source": tr.get("exit_source", ""),
             }
     for netuid in clips:
         out.setdefault(

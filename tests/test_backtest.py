@@ -515,6 +515,44 @@ class TestBugRegressions(unittest.TestCase):
         self.assertGreater(close_trades[0]["entry_price"], 0.015,
                           "Should use fresh tick pool state, not stale snapshot")
 
+    def test_force_close_uses_last_seen_pool_when_absent_from_final_tick(self):
+        """Force-close fallback regression (found 2026-09-10, bagbot
+        crash-guard study): a subnet absent from the FINAL tick was
+        force-closed at ENTRY price, neutralizing the trade. Sparse data
+        makes absence at the final tick common (crashed subnets trade
+        rarely), so crash losses were silently scored ~flat. Correct
+        behavior: exit against the last-seen pool state (pool state does
+        not change between transactions).
+        """
+        ticks = [
+            TickData(1000, {107: SubnetTick(107, 0.01, 500, 50000)}),   # buy here
+            TickData(2000, {107: SubnetTick(107, 0.002, 100, 50000)}),  # crash
+            TickData(3000, {99: SubnetTick(99, 0.05, 300, 6000)}),      # 107 absent
+        ]
+
+        class BuyOnce:
+            def __init__(self):
+                self.done = False
+            def on_tick(self, tick, positions, capital, pv):
+                if not self.done and 107 in tick.subnets:
+                    self.done = True
+                    return [Order(107, "buy", tao_amount=10, reason="test")]
+                return []
+
+        engine = BacktestEngine(capital=100.0, swap_fee_rate=0,
+                                gas_fee_tao=0, max_pool_pct=1.0)
+        results = engine.run(ticks, BuyOnce())
+
+        close_trades = [t for t in results.trades if t["reason"] == "end_of_data"]
+        self.assertEqual(len(close_trades), 1)
+        tr = close_trades[0]
+        self.assertEqual(tr["exit_source"], "last_seen")
+        # ~980 alpha sold into the crashed pool (100 TAO / 50000 alpha)
+        # must return ~2 TAO, nowhere near the ~10 TAO entry cost.
+        self.assertLess(tr["tao_received"], 3.0,
+                        "Exit must use last-seen crashed pool, not entry price")
+        self.assertLess(tr["pnl"], -6.0)
+
     def test_entry_price_cost_averaged(self):
         """Bug #1 regression: entry price must be cost-weighted average."""
         ticks = [
