@@ -464,5 +464,52 @@ class TestBuildDefaultYieldModelCacheFirst(unittest.TestCase):
         self.assertEqual(yr.source, AlphaYieldSource.FALLBACK)
 
 
+class TestImplausibleRateRejection(unittest.TestCase):
+    """A provider quote above the plausibility ceiling is a data error.
+
+    Motivating incident (2026-09-22): for deregistered-and-reborn netuids the
+    provider cascade computed rates across the rebirth boundary and returned
+    242/day (netuid 86) and 184/day (netuid 59). Accrual is linear in
+    rate x days, so an unclamped quote grew a 437-alpha paper position to
+    9.0M alpha over 85 days and AMM-valued it at nearly a whole subnet pool.
+    """
+
+    def test_absurd_rate_rejected_to_zero(self):
+        model = AlphaYieldModel(_StubProvider(242.344147))
+        yr = model.rate(86)
+        self.assertEqual(yr.rate_per_day, 0.0)
+        self.assertIsNotNone(yr.error)
+        self.assertIn("implausible", yr.error)
+        # accrual over a long hold must therefore be zero, not unbounded
+        self.assertEqual(
+            model.accrued_yield(netuid=86, alpha_qty=436.9, entry_time=0.0,
+                                now=85 * 86400.0),
+            0.0,
+        )
+
+    def test_source_preserved_for_diagnosis(self):
+        model = AlphaYieldModel(_StubProvider(50.0, source=AlphaYieldSource.EMPIRICAL))
+        yr = model.rate(59)
+        self.assertEqual(yr.source, AlphaYieldSource.EMPIRICAL)
+        self.assertEqual(yr.rate_per_day, 0.0)
+
+    def test_plausible_rate_untouched(self):
+        # documented real staker yield ~0.0014/day; healthy quotes 0.0015-0.005
+        model = AlphaYieldModel(_StubProvider(0.0047))
+        yr = model.rate(49)
+        self.assertAlmostEqual(yr.rate_per_day, 0.0047)
+        self.assertIsNone(yr.error)
+
+    def test_boundary_at_ceiling_is_accepted(self):
+        model = AlphaYieldModel(_StubProvider(0.02))
+        self.assertAlmostEqual(model.rate(1).rate_per_day, 0.02)
+        model2 = AlphaYieldModel(_StubProvider(0.0201))
+        self.assertEqual(model2.rate(1).rate_per_day, 0.0)
+
+    def test_ceiling_is_configurable(self):
+        model = AlphaYieldModel(_StubProvider(0.05), max_rate_per_day=0.10)
+        self.assertAlmostEqual(model.rate(36).rate_per_day, 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

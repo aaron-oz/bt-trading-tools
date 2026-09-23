@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_YIELD_CACHE_TTL_S: float = 3600.0   # 1 hr; yield is set by emission config
 
+# Above this per-day rate a quoted yield is treated as a provider data error
+# rather than a real rate, and rejected to 0.0 (see AlphaYieldModel.rate).
+#
+# Scale: measured staker yield on real holdings is ~0.0014/day (0.14%/day,
+# ~51%/yr); healthy validator-cache quotes observed across the fleet run
+# 0.0015-0.005/day. This ceiling of 0.02/day (2%/day, ~730%/yr) sits ~14x
+# above the measured norm, so it does not clip plausible high-emission
+# subnets, but it does catch the failure mode that motivated it: for a
+# deregistered-and-reborn netuid the provider cascade computes a rate across
+# the rebirth boundary and returns nonsense (observed 2026-09-22: netuid 86
+# at 242/day, netuid 59 at 184/day, and chain-sourced netuid 76 at 0.19/day).
+# Accrual is linear in rate x hold-days, so an unclamped bad rate inflates a
+# position without bound: netuid 86 grew a 437-alpha position to 9.0M alpha
+# over 85 days, which then AMM-valued to nearly an entire subnet pool.
+MAX_PLAUSIBLE_RATE_PER_DAY: float = 0.02
+
 
 # ── Data types ────────────────────────────────────────────────────────
 
@@ -209,6 +225,7 @@ class AlphaYieldModel:
         self,
         provider: CascadingYieldProvider | YieldRateProvider,
         cache_ttl_s: float = DEFAULT_YIELD_CACHE_TTL_S,
+        max_rate_per_day: float = MAX_PLAUSIBLE_RATE_PER_DAY,
     ):
         # Accept either a CascadingYieldProvider or a single YieldRateProvider.
         # Wrap bare providers so fetch_rate_with_source is always available.
@@ -217,6 +234,7 @@ class AlphaYieldModel:
         else:
             self._provider = CascadingYieldProvider([provider])
         self._cache_ttl_s = cache_ttl_s
+        self._max_rate_per_day = max_rate_per_day
         self._cache: dict[int, tuple[float, YieldRate]] = {}
 
     # ── Public ──────────────────────────────────────────────────────
@@ -226,6 +244,14 @@ class AlphaYieldModel:
 
         Never raises. On provider failure, returns a YieldRate with
         ``rate_per_day=0.0``, ``source=FALLBACK``, and ``error`` populated.
+
+        A rate that is negative, non-finite, or above ``max_rate_per_day`` is
+        treated as a provider data error, not a real rate: it is rejected to
+        0.0 with ``error`` populated (the originating ``source`` is kept so
+        the faulty tier stays identifiable). Rejecting rather than clamping
+        to the ceiling is deliberate — an implausible quote means the
+        provider is confused about this subnet, so no yield claim from it is
+        trustworthy, and crediting zero is the capital-preservation choice.
         """
         now = time.time()
         cached = self._cache.get(netuid)
@@ -236,6 +262,17 @@ class AlphaYieldModel:
             del self._cache[netuid]
 
         rate_val, source, error = self._provider.fetch_rate_with_source(netuid)
+        if error is None and (
+            not _finite(rate_val)
+            or rate_val < 0.0
+            or rate_val > self._max_rate_per_day
+        ):
+            error = (
+                f"implausible rate {rate_val!r}/day from {source} "
+                f"(ceiling {self._max_rate_per_day}/day); rejected to 0.0"
+            )
+            logger.warning("netuid=%s: %s", netuid, error)
+            rate_val = 0.0
         yr = YieldRate(
             netuid=netuid,
             rate_per_day=rate_val,
