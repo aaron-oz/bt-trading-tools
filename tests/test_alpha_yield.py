@@ -463,6 +463,35 @@ class TestBuildDefaultYieldModelCacheFirst(unittest.TestCase):
         yr = model.rate(netuid=44)
         self.assertEqual(yr.source, AlphaYieldSource.FALLBACK)
 
+    def test_unreadable_candidate_is_skipped_not_raised(self):
+        """A fallback candidate we lack permission to stat must be treated as
+        absent, not allowed to raise.
+
+        Regression for 2026-09-23: the first fallback candidate is
+        ``/root/.validator_selection/best_validators.json``. For a non-root
+        user on a box where ``/root`` is not traversable, ``Path.exists()``
+        raises ``PermissionError``, which escaped
+        ``build_default_yield_model()`` and made ``BacktestEngine()``
+        unconstructible for that user.
+        """
+        import os
+        from unittest import mock
+        os.environ.pop("VALIDATOR_CACHE_PATH", None)
+        os.environ.pop("BT_NETWORK", None)
+        os.environ.pop("TAOSTATS_DATA_DIR", None)
+
+        real_exists = Path.exists
+
+        def exists_denying_root(self, *a, **kw):
+            if str(self).startswith("/root/"):
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_exists(self, *a, **kw)
+
+        with mock.patch.object(Path, "exists", exists_denying_root):
+            model = build_default_yield_model()  # must not raise
+        yr = model.rate(netuid=44)
+        self.assertEqual(yr.source, AlphaYieldSource.FALLBACK)
+
 
 class TestImplausibleRateRejection(unittest.TestCase):
     """A provider quote above the plausibility ceiling is a data error.
