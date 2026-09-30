@@ -771,6 +771,24 @@ def _validator_cache_fallback_paths() -> tuple[str, ...]:
     )
 
 
+def _exists(p) -> bool:
+    """``Path.exists()`` that treats an unreadable path as absent.
+
+    The first fallback candidate is ``/root/.validator_selection/...``. On a
+    box where ``/root`` exists but is not traversable by the current user,
+    ``Path.exists()`` raises ``PermissionError`` rather than returning False,
+    which propagated out of ``build_default_yield_model()`` and made
+    ``BacktestEngine()`` unconstructible for any non-root user (hit while
+    running the 2026-09-23 EDB alignment backtests on the dev box). A path we
+    cannot stat is a path we cannot read, so treat it as missing and fall
+    through to the next candidate.
+    """
+    try:
+        return p.exists()
+    except OSError:
+        return False
+
+
 def _resolve_validator_cache_path():
     """Return the first existing validator-cache path from env → fallback list,
     or None if none exist. Returns ``pathlib.Path`` or ``None``.
@@ -780,10 +798,10 @@ def _resolve_validator_cache_path():
     cache_path_env = os.environ.get("VALIDATOR_CACHE_PATH")
     if cache_path_env:
         p = Path(cache_path_env)
-        return p if p.exists() else None
+        return p if _exists(p) else None
     for candidate in _validator_cache_fallback_paths():
         p = Path(candidate)
-        if p.exists():
+        if _exists(p):
             return p
     return None
 
