@@ -4,6 +4,11 @@ Derived portfolio-level metrics from the v1 trade log.
 Reads `portfolio_snapshot` records only. The equity curve is whatever the
 bot reported — reconstruction fidelity depends on snapshot cadence and is
 the bot's responsibility (one snapshot per evaluation tick is the contract).
+
+Note (2026-10-01): for comparing backtest and paper, use
+``bt_trading_tools.backtest.equity_metrics``, the single definition both
+sides share. Nothing in alpha-trading, bt-strategy or autobot imports this
+module's metrics as of that date.
 """
 from __future__ import annotations
 

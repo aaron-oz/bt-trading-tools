@@ -31,6 +31,7 @@ from bt_trading_tools.backtest.types import (
 )
 from bt_trading_tools.backtest.stats import (
     compute_stats,
+    equity_metrics,
     compute_regime_stats,
     validate_cv_results,
     BacktestStats,
@@ -42,6 +43,7 @@ from bt_trading_tools.backtest.cv import PurgedWalkForwardCV, CVFold
 from bt_trading_tools.backtest.scheduled import ScheduledStrategy
 
 __all__ = [
+    "equity_metrics",
     "BacktestEngine",
     "BacktestResults",
     "Order",
