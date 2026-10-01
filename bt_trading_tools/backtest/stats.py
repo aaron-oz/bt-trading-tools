@@ -11,7 +11,82 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
+
+def equity_metrics(
+    points: Iterable[tuple[float, float]],
+    starting_equity: Optional[float] = None,
+) -> dict:
+    """Return, Sharpe and max drawdown from an equity series.
+
+    The ONE definition used for both backtest (BacktestEngine stats) and
+    paper (the drift check), so the two are comparable by construction
+    (decided 2026-10-01; alpha-trading
+    docs/backtest_paper_duplication_audit_2026_10_01.md).
+
+    Definitions:
+      * The series is resampled to the LAST positive value per UTC calendar
+        day. This makes the result independent of tick cadence (no
+        ticks_per_year to get wrong) and drops intraday transients.
+      * baseline = ``starting_equity`` if given, else the first daily value.
+      * total_return_pct = final / baseline - 1, in percent.
+      * annualized_return_pct = total_return_pct * 365 / days (simple, not
+        compounded), days = span of the input timestamps.
+      * sharpe = mean(daily return) / sample stdev(daily return) * sqrt(365),
+        with daily returns taken from the baseline through each daily value.
+        None if fewer than 2 daily returns or zero variance.
+      * max_drawdown_pct = largest peak-to-trough fall of the daily series
+        (baseline included as the first peak), in percent, >= 0.
+
+    Args:
+        points: (unix_ts_seconds, equity) pairs, any order, any cadence.
+        starting_equity: capital at the start (e.g. the backtest's starting
+            capital). When None the first daily value is the baseline, which
+            is what a paper record without a trustworthy inception mark needs.
+    """
+    by_day: dict = {}
+    first_ts = last_ts = None
+    for ts, eq in sorted(points, key=lambda p: p[0]):
+        first_ts = ts if first_ts is None else first_ts
+        last_ts = ts
+        if eq is None or eq <= 0:
+            continue
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        by_day[day] = eq
+    daily = [by_day[d] for d in sorted(by_day)]
+    empty = {"total_return_pct": None, "annualized_return_pct": None,
+             "sharpe": None, "max_drawdown_pct": None,
+             "n_days": len(daily), "days": 0.0}
+    if not daily:
+        return empty
+    series = ([starting_equity] if starting_equity else []) + daily
+    if len(series) < 2:
+        return empty
+    base, final = series[0], series[-1]
+    days = (last_ts - first_ts) / 86400.0 if first_ts is not None else 0.0
+    total = (final / base - 1) * 100
+    rets = [series[i] / series[i - 1] - 1 for i in range(1, len(series))
+            if series[i - 1] > 0]
+    sharpe = None
+    if len(rets) >= 2:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        if var > 0:
+            sharpe = mean / math.sqrt(var) * math.sqrt(365)
+    peak, max_dd = series[0], 0.0
+    for v in series:
+        peak = max(peak, v)
+        max_dd = max(max_dd, (peak - v) / peak * 100 if peak > 0 else 0.0)
+    return {
+        "total_return_pct": total,
+        "annualized_return_pct": total * 365 / days if days > 0 else None,
+        "sharpe": sharpe,
+        "max_drawdown_pct": max_dd,
+        "n_days": len(daily),
+        "days": days,
+    }
 
 
 @dataclass
@@ -21,20 +96,26 @@ class BacktestStats:
     n_wins: int
     n_losses: int
     win_rate: float                   # percentage
-    total_pnl: float                  # TAO
-    total_return_pct: float           # percentage
+    total_pnl: float                  # TAO, realized (sum of trade pnl)
+    total_return_pct: float           # percentage, equity-based (equity_metrics)
     total_fees: float                 # TAO
     avg_pnl: float                    # TAO per trade
     median_pnl: float                 # TAO per trade
     avg_winner: float                 # TAO
     avg_loser: float                  # TAO
     avg_hold_seconds: float           # seconds
-    max_drawdown_pct: float           # percentage
-    sharpe: float                     # annualized (assumes daily ticks)
+    max_drawdown_pct: float           # percentage, daily series (equity_metrics)
+    sharpe: float                     # daily returns, sqrt(365) (equity_metrics)
     n_subnets_traded: int
     final_equity: float               # TAO
     starting_capital: float           # TAO
     by_reason: dict[str, dict]        # exit_reason → {count, total_pnl, avg_pnl}
+    # Added 2026-10-01 when the headline fields moved to equity_metrics.
+    annualized_return_pct: Optional[float] = None   # simple, from equity
+    realized_return_pct: float = 0.0  # total_pnl / starting_capital (the old total_return_pct)
+    sharpe_per_tick: float = 0.0      # old definition: per-tick returns,
+                                      # population stdev, sqrt(ticks_per_year)
+    max_drawdown_per_tick_pct: float = 0.0  # old definition: every tick
 
 
 def compute_stats(
@@ -117,25 +198,40 @@ def compute_stats(
     total_pnl = sum(pnls)
     final_eq = equity_curve[-1]["total_equity"] if equity_curve else starting_capital
 
+    em = equity_metrics(
+        [(pt["timestamp"], pt["total_equity"]) for pt in equity_curve
+         if "timestamp" in pt],
+        starting_equity=starting_capital,
+    )
+    realized_ret = (round(total_pnl / starting_capital * 100, 2)
+                    if starting_capital > 0 else 0)
+
     return BacktestStats(
         n_trades=len(trades),
         n_wins=len(winners),
         n_losses=len(losers),
         win_rate=len(winners) / len(trades) * 100 if trades else 0,
         total_pnl=round(total_pnl, 6),
-        total_return_pct=round(total_pnl / starting_capital * 100, 2) if starting_capital > 0 else 0,
+        total_return_pct=(round(em["total_return_pct"], 2)
+                          if em["total_return_pct"] is not None else realized_ret),
         total_fees=round(sum(fees), 6),
         avg_pnl=round(total_pnl / len(trades), 6),
         median_pnl=round(median, 6),
         avg_winner=round(sum(winners) / len(winners), 6) if winners else 0,
         avg_loser=round(sum(losers) / len(losers), 6) if losers else 0,
         avg_hold_seconds=round(sum(holds) / len(holds), 1) if holds else 0,
-        max_drawdown_pct=round(max_dd, 2),
-        sharpe=round(sharpe, 3),
+        max_drawdown_pct=(round(em["max_drawdown_pct"], 2)
+                          if em["max_drawdown_pct"] is not None else round(max_dd, 2)),
+        sharpe=round(em["sharpe"], 3) if em["sharpe"] is not None else 0.0,
         n_subnets_traded=len(netuids),
         final_equity=round(final_eq, 6),
         starting_capital=starting_capital,
         by_reason=reasons,
+        annualized_return_pct=(round(em["annualized_return_pct"], 2)
+                               if em["annualized_return_pct"] is not None else None),
+        realized_return_pct=realized_ret,
+        sharpe_per_tick=round(sharpe, 3),
+        max_drawdown_per_tick_pct=round(max_dd, 2),
     )
 
 
