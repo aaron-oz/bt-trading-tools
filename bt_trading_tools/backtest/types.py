@@ -17,6 +17,13 @@ class SubnetTick:
     alpha_pool: float     # Alpha liquidity in AMM pool
     # Strategy-specific signal columns (emission_share, pct_change, etc.)
     signals: dict[str, float] = field(default_factory=dict)
+    # Subnet identity. A netuid is a slot, not an identity: when a subnet is
+    # deregistered the next registration reuses the number. ``generation``
+    # distinguishes successive subnets in the same slot (0, 1, 2, ... in the
+    # order they held it, or the chain registration block). None = unknown,
+    # in which case the engine cannot detect a re-registration for this
+    # subnet. Stamp it with ``bt_trading_tools.utils.lifecycle.stamp_generations``.
+    generation: int | None = None
 
 
 @dataclass
@@ -38,6 +45,13 @@ class Position:
     entry_time: int          # unix timestamp
     entry_fees: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Generation of the subnet the position was opened in (see
+    # SubnetTick.generation). None = unknown.
+    generation: int | None = None
+    # Time from which not-yet-folded alpha yield accrues. Equals entry_time
+    # until a top-up or partial sell folds accrued yield into alpha_qty
+    # (see bt_trading_tools.ledger). None means "use entry_time".
+    yield_anchor_time: int | None = None
 
 
 @dataclass

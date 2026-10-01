@@ -78,6 +78,7 @@ def coerce_to_utc_timestamp(t) -> pd.Timestamp:
 def load_sdk_ticks(
     start, end,
     csv_path: Union[str, Path] = DEFAULT_SDK_POOL_STATE_CSV,
+    stamp_identity: bool = True,
 ) -> list:
     """Build TickData list from SDK pool-state CSV (15-minute cadence).
 
@@ -86,8 +87,13 @@ def load_sdk_ticks(
     `/root/sdk_backfill/sdk_snapshots/sdk_pool_state.csv` on bot-vps; pull
     locally via rsync or use the existing `/tmp/autobot_paper_data/` cache.
 
-    Columns expected: timestamp, netuid, price, tao_in, alpha_in. Other
+    Columns expected: timestamp, netuid, price, tao_in, alpha_in, and
+    alpha_out (staked alpha, used only to detect re-registrations). Other
     SDK columns (block, emission, k, ...) are ignored.
+
+    With ``stamp_identity`` (default) every SubnetTick gets a
+    ``generation`` so BacktestEngine can close a position whose netuid was
+    re-registered (see bt_trading_tools.utils.lifecycle).
 
     Returns
     -------
@@ -100,9 +106,13 @@ def load_sdk_ticks(
     end_ts = coerce_to_utc_timestamp(end)
     df = pd.read_csv(
         csv_path,
-        usecols=["timestamp", "netuid", "price", "tao_in", "alpha_in"],
+        usecols=["timestamp", "netuid", "price", "tao_in", "alpha_in", "alpha_out"],
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    # Detect on the window plus a day of lead-in, BEFORE the zero-pool filter
+    # below (a dying pool's last rows are part of the signal).
+    lead = df[(df["timestamp"] >= start_ts - pd.Timedelta(days=1))
+              & (df["timestamp"] <= end_ts)]
     df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
     df = df[(df["price"] > 0) & (df["tao_in"] > 0) & (df["alpha_in"] > 0)]
     df["unix_ts"] = to_unix_seconds(df["timestamp"])
@@ -119,6 +129,10 @@ def load_sdk_ticks(
                 signals={},
             )
         ticks.append(TickData(timestamp=int(ts), subnets=subnets))
+    if stamp_identity:
+        from bt_trading_tools.utils.lifecycle import (
+            find_reregistrations, stamp_generations)
+        stamp_generations(ticks, find_reregistrations(lead))
     return ticks
 
 
@@ -131,6 +145,7 @@ def load_parquet_ticks(
     pool_parquet: Union[str, Path] = DEFAULT_POOL_HISTORY_PARQUET,
     pool_tolerance_days: int = 2,
     drop_startup_mode: bool = True,
+    stamp_identity: bool = True,
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
@@ -155,6 +170,12 @@ def load_parquet_ticks(
     backtests (data-source artifact, not engine bug). Prefer SDK for
     windows that overlap paper-bot operation; parquet only for
     long-history OOS work.
+
+    With ``stamp_identity`` (default) every SubnetTick gets a
+    ``generation``, detected on the UNFILTERED daily pool history (startup
+    rows kept), so BacktestEngine can close a position whose netuid was
+    re-registered. Dropping startup rows otherwise hides the event and turns
+    it into an apparent price jump across a data gap.
     """
     from bt_trading_tools.backtest.types import SubnetTick, TickData
 
@@ -174,6 +195,7 @@ def load_parquet_ticks(
         (pool["unix_ts"] >= start_ts.timestamp() - 86400)
         & (pool["unix_ts"] <= end_ts.timestamp())
     ]
+    pool_unfiltered = pool
     if drop_startup_mode:
         pool = pool[pool["startup_mode"] == False]
     pool = pool.assign(
@@ -207,6 +229,14 @@ def load_parquet_ticks(
                 signals={},
             )
         ticks.append(TickData(timestamp=int(ts), subnets=subnets))
+    if stamp_identity:
+        from bt_trading_tools.utils.lifecycle import (
+            reregistrations_from_pool_history, stamp_generations)
+        # Pool data is daily: floor events to midnight so no hourly tick on
+        # the event day is attributed to the dead subnet.
+        stamp_generations(
+            ticks, reregistrations_from_pool_history(pool_unfiltered),
+            floor_to_day=True)
     return ticks
 
 
