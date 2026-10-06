@@ -175,28 +175,56 @@ def _write_parquet_fixture(tmp_path, jump=0.25):
     return o, p
 
 
-def test_load_parquet_ticks_rescales_reserves_by_default(tmp_path):
+@pytest.fixture
+def parquet_mod(monkeypatch):
     pytest.importorskip("pyarrow")
-    from bt_trading_tools.data.ticks import load_parquet_ticks
+    import bt_trading_tools.data.ticks as m
+    monkeypatch.setattr(m, "_PARQUET_WARNED", False)
+    return m
+
+
+def test_load_parquet_ticks_defaults_are_the_historical_behavior_and_warn_once(tmp_path, parquet_mod):
     o, p = _write_parquet_fixture(tmp_path)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        ticks = load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False)
-    assert ticks
+    with pytest.warns(RuntimeWarning, match="known issues"):
+        ticks = parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False)
     late = ticks[-1].subnets[9]
-    assert math.isclose(late.tao_pool / late.alpha_pool, late.price, rel_tol=1e-9)           # consistent with the price
-    assert math.isclose(late.tao_pool * late.alpha_pool, 5000e0 * 500_000e0, rel_tol=1e-9)   # k from the snapshot
-    assert late.signals["reserve_gap_raw"] == pytest.approx(1 / 1.25 - 1, rel=1e-6)           # raw implied price was 20% low
+    assert late.signals["reserve_gap_raw"] == pytest.approx(1 / 1.25 - 1, rel=1e-6)    # daily reserves left stale (implied price 20% low)
+    assert reserve_price_gap(ticks)["max_abs_gap"] > 0.15
     assert late.signals["reserve_age_s"] > 0
+    with warnings.catch_warnings():                                                    # second call in the same process: silent
+        warnings.simplefilter("error", RuntimeWarning)
+        parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False)
+
+
+def test_load_parquet_ticks_rescale_is_opt_in_and_matches_price_at_constant_k(tmp_path, parquet_mod):
+    o, p = _write_parquet_fixture(tmp_path)
+    with pytest.warns(RuntimeWarning):
+        ticks = parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False, reserves="rescale")
+    late = ticks[-1].subnets[9]
+    assert math.isclose(late.tao_pool / late.alpha_pool, late.price, rel_tol=1e-9)
+    assert math.isclose(late.tao_pool * late.alpha_pool, 5000e0 * 500_000e0, rel_tol=1e-9)
     assert reserve_price_gap(ticks)["max_abs_gap"] < 1e-9
 
 
-def test_load_parquet_ticks_raw_keeps_stale_reserves_and_warns(tmp_path):
-    pytest.importorskip("pyarrow")
-    from bt_trading_tools.data.ticks import load_parquet_ticks
+def test_bar_label_end_stamps_ticks_with_the_bar_end(tmp_path, parquet_mod):
+    """OHLCV time is the bar START; its close is the price at the bar END. 'end' moves the label so the close is known at its timestamp."""
     o, p = _write_parquet_fixture(tmp_path)
-    with pytest.warns(RuntimeWarning, match="raw"):
-        ticks = load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False, reserves="raw")
-    assert reserve_price_gap(ticks)["max_abs_gap"] > 0.15
+    ohlcv = pd.read_parquet(o)
+    first_bar = int(pd.Timestamp(ohlcv.time.min()).timestamp())
+    with pytest.warns(RuntimeWarning):
+        start = parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        end = parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, stamp_identity=False, bar_label="end")
+    assert start[0].timestamp == first_bar
+    assert end[0].timestamp == first_bar + 3600
+    assert [t.subnets[9].price for t in start] == [t.subnets[9].price for t in end]          # same closes, later labels
+    assert end[-1].timestamp == start[-1].timestamp + 3600
+
+
+def test_load_parquet_ticks_rejects_unknown_options(tmp_path, parquet_mod):
+    o, p = _write_parquet_fixture(tmp_path)
     with pytest.raises(ValueError):
-        load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, reserves="bogus")
+        parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, reserves="bogus")
+    with pytest.raises(ValueError):
+        parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, bar_label="middle")

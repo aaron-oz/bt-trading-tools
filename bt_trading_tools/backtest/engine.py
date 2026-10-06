@@ -411,7 +411,8 @@ class BacktestEngine:
                 f"{100 * RESERVE_GAP_TOL:.0f}%. The engine fills from the reserves, so these "
                 "fills are mispriced (typical cause: hourly prices paired with daily reserves, "
                 "as in load_parquet_ticks with reserves='raw'). Use contemporaneous reserves "
-                "(SDK ticks) or reserves='rescale'. See docs/known_traps.md.",
+                "(SDK ticks); load_parquet_ticks(reserves='rescale') matches the price but is not "
+                "validated. See docs/known_traps.md.",
                 RuntimeWarning, stacklevel=3,
             )
         seed = self.realism_rng_seed
