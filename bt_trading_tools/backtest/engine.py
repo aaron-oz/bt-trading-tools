@@ -171,6 +171,7 @@ class BacktestEngine:
         self,
         ticks: list[TickData],
         strategy: Strategy,
+        initial_positions: Optional[dict[int, Position]] = None,
     ) -> BacktestResults:
         """Run the backtest.
 
@@ -181,12 +182,25 @@ class BacktestEngine:
                 ``bt_trading_tools.utils.lifecycle.stamp_generations``) so the
                 engine can tell successive subnets in one netuid apart.
             strategy: Implements Strategy protocol (on_tick method).
+            initial_positions: Optional open positions the run starts with, for
+                comparing against a live or paper book that was not flat at the
+                window start. ``capital`` (the constructor argument) is CASH
+                only: the cost basis of these positions is not deducted from
+                it, so the starting equity is ``capital`` plus their liquidation
+                value at the first tick. Each position is copied; give it the
+                ``generation`` of its subnet (see ``stamp_generations``) or the
+                identity guard cannot protect it, and ``yield_anchor_time`` (or
+                leave it ``None`` to accrue yield from ``entry_time``). The
+                reported ``stats`` still use ``capital`` as the return base, so
+                compute returns from ``equity_curve`` when positions are given.
 
         Returns:
             BacktestResults with stats, trades, equity curve.
         """
         capital = self.starting_capital
-        positions: dict[int, Position] = {}
+        positions: dict[int, Position] = {
+            int(n): copy.copy(p) for n, p in (initial_positions or {}).items()
+        }
         trades: list[dict] = []
         equity_curve: list[dict] = []
         # Pending delayed orders: (execute_at_tick_idx, order, decision_tick_snapshot)
