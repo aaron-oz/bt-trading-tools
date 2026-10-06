@@ -22,14 +22,58 @@ docs/bittensor-mechanics-primer.md § Deregistration). Before 2026-09-10
 the engine's fallback was ENTRY price (bug; see engine.py force-close),
 which neutralized trades on subnets absent from the final tick.
 Per-position outcomes are read from ``results.trades``.
+
+Realism seeds (known trap, fixed 2026-10): each window is a NEW engine, and a
+new engine with the default ``realism_rng_seed=0`` replays the same realism
+draws. Averaging many one-trade windows then averages one draw N times and
+overstates returns (measured about +0.4 percentage points per 1 TAO round
+trip). This module therefore gives every window its own deterministic seed,
+derived from a base seed and the window (``derive_window_seed``). Passing
+``realism_rng_seed=<int>`` sets the BASE seed (reproducible, still distinct per
+window); ``None`` is nondeterministic. If you pass your own ``engine_factory``
+you own the seeding; ``seeded_engine_factory`` builds a safe one. See
+docs/known_traps.md.
 """
 from __future__ import annotations
 
+import hashlib
 from bisect import bisect_left, bisect_right
+from itertools import count
 from typing import Any, Callable, Iterable, Optional
 
 from bt_trading_tools.backtest.engine import BacktestEngine
 from bt_trading_tools.backtest.types import Order, Position, TickData
+
+
+def derive_window_seed(base_seed: int, entry_ts: int, netuids: Iterable[int]) -> int:
+    """Deterministic, process-independent realism seed for one window.
+
+    A hash (not Python's salted ``hash``) of ``(base_seed, entry_ts, sorted
+    netuids)``, so reruns reproduce exactly while different windows get
+    different draws.
+    """
+    key = (f"{int(base_seed)}|{int(entry_ts)}|"
+           f"{','.join(str(int(n)) for n in sorted(netuids))}").encode()
+    return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") % (2**31 - 1)
+
+
+def seeded_engine_factory(base_seed: int = 0, **fixed_kwargs: Any) -> Callable[..., BacktestEngine]:
+    """An ``engine_factory`` that gives every engine it builds a distinct seed.
+
+    Use it whenever you run many independent windows or trades, each in its own
+    engine (a new engine with a repeated seed repeats the same realism draws).
+    Seeds are ``base_seed + 1, base_seed + 2, ...`` in call order, so a run is
+    reproducible as long as the calls happen in the same order. Extra keyword
+    arguments are passed to every engine; per-call keywords override them.
+    """
+    counter = count(int(base_seed) + 1)
+
+    def factory(**kwargs: Any) -> BacktestEngine:
+        merged = {**fixed_kwargs, **kwargs}
+        merged["realism_rng_seed"] = next(counter)
+        return BacktestEngine(**merged)
+
+    return factory
 
 
 class ScheduledBasketStrategy:
@@ -111,12 +155,23 @@ def run_basket_window(
 
     ``engine_kwargs`` are forwarded to BacktestEngine (friction defaults
     stay ON per project policy). Capital defaults to the basket total.
+
+    Seeding: without an ``engine_factory`` the window's realism seed is
+    ``derive_window_seed(base, entry_ts, clips)`` where ``base`` is the
+    ``realism_rng_seed`` you pass (default 0); ``realism_rng_seed=None`` stays
+    nondeterministic. With an ``engine_factory`` you own the seeding (see
+    ``seeded_engine_factory``).
     """
     window = slice_ticks(ticks, entry_ts, exit_ts)
     strategy = ScheduledBasketStrategy(
         clips, entry_ts, entry_deadline_ts=entry_ts + entry_deadline_s
     )
     engine_kwargs.setdefault("capital", sum(clips.values()) * 1.001)
+    if engine_factory is None:
+        base = engine_kwargs.pop("realism_rng_seed", 0)
+        engine_kwargs["realism_rng_seed"] = (
+            None if base is None else derive_window_seed(base, entry_ts, clips)
+        )
     factory = engine_factory or BacktestEngine
     engine = factory(**engine_kwargs)
     results = engine.run(window, strategy)
@@ -159,8 +214,9 @@ def panel_forward_returns(
     """Panel API: for each (entry_ts, clips) run one basket window.
 
     Returns a flat list of row dicts: {"entry_ts", "netuid", plus the
-    run_basket_window outcome fields}. Deterministic given engine_kwargs
-    with a fixed realism seed.
+    run_basket_window outcome fields}. Deterministic given engine_kwargs and
+    the base ``realism_rng_seed`` (each window still gets its own derived
+    seed, so windows do not share one set of realism draws).
     """
     rows: list[dict] = []
     for entry_ts, clips in entries:
