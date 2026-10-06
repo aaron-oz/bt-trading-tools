@@ -17,6 +17,21 @@ calibrated against it. The parquet sources cover a longer history
 See `docs/realistic_backtesting_guide.md` for the source-choice
 guidance.
 
+KNOWN TRAP (reserves vs price): BacktestEngine fills from the pool RESERVES
+(``tao_pool``, ``alpha_pool``), not from ``SubnetTick.price``. The parquet
+source pairs an HOURLY close with a DAILY reserve snapshot; carried forward,
+the reserves lag the price by up to a day. Around surges the pool-implied
+price averaged 0.92 x the tick price at entry (measured 2026-10 on 160 surge
+episodes), i.e. entries priced about 8% below the tick price, which lifted the
+mean 24-hour return on those same episodes from +7.8% (contemporaneous SDK
+reserves) to +11.2%. ``load_parquet_ticks``
+now rescales the reserves to the hourly close by default (``reserves="rescale"``);
+this removes the price mismatch but not any change in pool DEPTH during the day.
+Where depth matters (surges, large clips) use SDK ticks. SDK snapshots exist
+from 2026-02-11 locally and, on bot-vps, as a 5-minute file back to
+2025-08-18 (``/root/sdk_backfill/sdk_snapshots/sdk_5min.csv``, ends 2026-02-14).
+Check any tick source with ``reserve_price_gap``. See docs/known_traps.md.
+
 Hexagonal precision note: pandas 3.0 defaults to microsecond resolution
 on datetime64; `astype("int64")` returns microseconds, not nanoseconds.
 `_to_unix_seconds` handles both; do NOT use the `// 10**9` shortcut
@@ -24,8 +39,10 @@ which is 1000x off on us-precision data.
 """
 from __future__ import annotations
 
+import math
+import warnings
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 
 import pandas as pd
 
@@ -136,6 +153,45 @@ def load_sdk_ticks(
     return ticks
 
 
+# ── Reserve / price consistency ───────────────────────────────────────
+
+
+def rescale_reserves_to_price(tao_pool: float, alpha_pool: float, price: float) -> tuple[float, float]:
+    """Rescale constant-product reserves to a target price, keeping k = tao x alpha.
+
+    Returns ``(tao', alpha')`` with ``tao' x alpha' = tao x alpha`` and
+    ``tao' / alpha' = price``: ``tao' = sqrt(k x price)``, ``alpha' = sqrt(k / price)``.
+    Fixes a price/reserve mismatch (reserves older than the price); it cannot
+    recover a change in pool depth (k) since the reserve snapshot.
+    """
+    k = tao_pool * alpha_pool
+    return math.sqrt(k * price), math.sqrt(k / price)
+
+
+def reserve_price_gap(ticks: Iterable) -> dict:
+    """How far the pool-implied price (tao_pool / alpha_pool) is from each tick's own price.
+
+    The engine fills from the reserves, so a large gap means mispriced fills.
+    Accepts a list of ``TickData``. Returns ``{"n", "median_abs_gap",
+    "share_over_2pct", "share_over_5pct", "max_abs_gap"}`` over every
+    (tick, subnet) with positive price and reserves. On the SDK feed the
+    median is about 0.005% and under 1% of subnet-ticks exceed 5%
+    (measured 2026-10); a median above about 1% or a share over 5% above
+    about 10% suggests stale reserves.
+    """
+    gaps = []
+    for t in ticks:
+        for st in t.subnets.values():
+            if st.price > 0 and st.alpha_pool > 0 and st.tao_pool > 0:
+                gaps.append(abs(st.tao_pool / st.alpha_pool / st.price - 1.0))
+    if not gaps:
+        return {"n": 0, "median_abs_gap": float("nan"), "share_over_2pct": float("nan"),
+                "share_over_5pct": float("nan"), "max_abs_gap": float("nan")}
+    s = pd.Series(gaps)
+    return {"n": int(len(s)), "median_abs_gap": float(s.median()), "share_over_2pct": float((s > 0.02).mean()),
+            "share_over_5pct": float((s > 0.05).mean()), "max_abs_gap": float(s.max())}
+
+
 # ── Parquet (hourly OHLCV + daily pool) → TickData ────────────────────
 
 
@@ -146,12 +202,28 @@ def load_parquet_ticks(
     pool_tolerance_days: int = 2,
     drop_startup_mode: bool = True,
     stamp_identity: bool = True,
+    reserves: str = "rescale",
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
     Use for OOS windows where SDK pool_state.csv doesn't reach (SDK starts
     2026-02-11). Hourly cadence vs SDK's 15-min; pool data is daily,
     forward-filled to each hourly tick via `pd.merge_asof`.
+
+    ``reserves`` (default ``"rescale"``): the engine fills from reserves, and
+    daily reserves lag the hourly close, so by default the daily snapshot
+    supplies only the invariant k = tao x alpha and the reserves are rescaled to
+    the hourly close (``rescale_reserves_to_price``). ``"raw"`` keeps the daily
+    reserves unchanged (the behavior before 2026-10) and warns: fills are then
+    mispriced whenever price moved since the snapshot, most severely around
+    surges. Rescaling does not capture changes in pool depth; prefer SDK ticks
+    where depth matters. Each tick's ``signals`` carries ``reserve_gap_raw``
+    (raw implied price / close - 1) and ``reserve_age_s`` (age of the daily
+    snapshot).
+
+    Subnets are emitted only in hours where they traded (no forward fill of
+    quiet hours), so a strategy that needs a subnet present every hour must
+    handle gaps.
 
     `pool_history.parquet` stores `total_tao` and `alpha_in_pool` in RAO;
     this loader converts to TAO / alpha-tokens before building ticks.
@@ -179,6 +251,17 @@ def load_parquet_ticks(
     """
     from bt_trading_tools.backtest.types import SubnetTick, TickData
 
+    if reserves not in ("rescale", "raw"):
+        raise ValueError(f"reserves must be 'rescale' or 'raw', got {reserves!r}")
+    if reserves == "raw":
+        warnings.warn(
+            "load_parquet_ticks(reserves='raw') pairs hourly prices with daily reserves; the engine fills "
+            "from the reserves, so fills are mispriced whenever price moved since the snapshot (about 8% "
+            "cheap at surge entries in 2026-10 measurements). Use the default reserves='rescale' or SDK "
+            "ticks. See docs/known_traps.md.",
+            RuntimeWarning, stacklevel=2,
+        )
+
     start_ts = coerce_to_utc_timestamp(start)
     end_ts = coerce_to_utc_timestamp(end)
 
@@ -202,7 +285,7 @@ def load_parquet_ticks(
         total_tao=pool["total_tao"] / 1e9,
         alpha_in_pool=pool["alpha_in_pool"] / 1e9,
     )
-    pool = pool[["netuid", "unix_ts", "total_tao", "alpha_in_pool"]].sort_values(
+    pool = pool.assign(pool_ts=pool["unix_ts"])[["netuid", "unix_ts", "pool_ts", "total_tao", "alpha_in_pool"]].sort_values(
         ["netuid", "unix_ts"]
     )
 
@@ -221,12 +304,17 @@ def load_parquet_ticks(
     for ts, group in merged.groupby("unix_ts", sort=True):
         subnets = {}
         for _, row in group.iterrows():
+            tao_r, alpha_r, close = float(row["total_tao"]), float(row["alpha_in_pool"]), float(row["close"])
+            gap_raw = tao_r / alpha_r / close - 1.0
+            if reserves == "rescale":
+                tao_r, alpha_r = rescale_reserves_to_price(tao_r, alpha_r, close)
             subnets[int(row["netuid"])] = SubnetTick(
                 netuid=int(row["netuid"]),
-                price=float(row["close"]),
-                tao_pool=float(row["total_tao"]),
-                alpha_pool=float(row["alpha_in_pool"]),
-                signals={},
+                price=close,
+                tao_pool=tao_r,
+                alpha_pool=alpha_r,
+                signals={"reserve_gap_raw": gap_raw,
+                         "reserve_age_s": float(row["unix_ts"] - row["pool_ts"])},
             )
         ticks.append(TickData(timestamp=int(ts), subnets=subnets))
     if stamp_identity:
@@ -246,6 +334,8 @@ __all__ = [
     "DEFAULT_SDK_POOL_STATE_CSV",
     "to_unix_seconds",
     "coerce_to_utc_timestamp",
+    "rescale_reserves_to_price",
+    "reserve_price_gap",
     "load_sdk_ticks",
     "load_parquet_ticks",
 ]
