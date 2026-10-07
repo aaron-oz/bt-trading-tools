@@ -45,6 +45,36 @@ class BacktestResults:
     # refund. False means the run could not tell subnets in the same slot
     # apart; see bt_trading_tools.utils.lifecycle.stamp_generations.
     identity_guard_active: bool = False
+    # Reserve-versus-price consistency of the orders the strategy placed:
+    # how many orders were checked, and how many were placed against a pool
+    # whose reserves imply a price more than RESERVE_GAP_TOL away from the
+    # tick's own price. The engine fills from the RESERVES, not from
+    # ``SubnetTick.price``, so a large share here means the ticks pair a
+    # price with stale reserves (for example hourly closes with daily pool
+    # snapshots) and fills are mispriced. See docs/known_traps.md.
+    orders_checked: int = 0
+    orders_on_inconsistent_reserves: int = 0
+
+
+# A run is flagged when more than this share of its orders (at least
+# RESERVE_GAP_MIN_ORDERS of them) sit on reserves whose implied price differs
+# from the tick price by more than RESERVE_GAP_TOL. On the SDK feed the
+# share is under 1%; on hourly closes paired with daily reserves it is large
+# around surges (measured 2026-10: pool-implied price averaged 0.92 x the
+# tick price at surge entries).
+RESERVE_GAP_TOL = 0.05
+RESERVE_GAP_SHARE_WARN = 0.10
+RESERVE_GAP_MIN_ORDERS = 10
+
+# Same-seed trap: every engine built with the same ``realism_rng_seed``
+# replays the same realism draws. Averaging many near-single-trade runs under
+# one seed therefore averages one draw, not many. Heuristic guard: after this
+# many runs with at most FEW_FILL_MAX fills each under one seed in a process,
+# warn once for that seed (see docs/known_traps.md).
+SAME_SEED_WARN_AFTER = 25
+FEW_FILL_MAX = 4
+_SEED_FEW_FILL_RUNS: dict[int, int] = {}
+_SEED_WARNED: set[int] = set()
 
 
 # Default flat-fee constants — used only when fee_model=None and no chain
@@ -126,6 +156,19 @@ class BacktestEngine:
             realism_rng_seed: Seed for the realism RNG. Defaults to 0 so
                 backtest runs are reproducible — same data + same strategy
                 = same realised outcomes. Pass None for nondeterministic.
+                **TRAP: the seed is per ENGINE, not per trade.** Every new
+                engine with the same seed replays the same draws, so the
+                realism noise of N independent one-trade runs is one draw
+                counted N times, not N draws. Measured 2026-10: for a 1 TAO
+                round trip on a deep pool at unchanged price, seed 0 gave
+                -0.01% while 200 seeds averaged -0.45% (sd 0.28%), so
+                one-trade runs under the default seed overstate returns by
+                about 0.4 percentage points. A single long run with many
+                trades is not affected (draws advance trade to trade). When
+                you run many independent windows or trades, give each its
+                own seed: use ``bt_trading_tools.backtest.panel.
+                seeded_engine_factory`` or ``panel_forward_returns`` (which
+                does this by default). See docs/known_traps.md.
             pool_safety_checker: Optional ``PoolSafetyChecker`` (from
                 ``bt_strategy.regime.pool_safety``) that drops "buy"
                 orders for subnets flagged by the slow_drain / fast_rug /
@@ -161,11 +204,14 @@ class BacktestEngine:
         else:
             self.yield_model = yield_model
         self.uses_proxy = uses_proxy
+        self.realism_rng_seed = realism_rng_seed
         self._realism = RealismSimulator(
             realism_config or RealismConfig(),
             rng_seed=realism_rng_seed,
         )
         self.pool_safety_checker = pool_safety_checker
+        self._orders_checked = 0
+        self._orders_gap = 0
 
     def run(
         self,
@@ -198,6 +244,8 @@ class BacktestEngine:
             BacktestResults with stats, trades, equity curve.
         """
         capital = self.starting_capital
+        self._orders_checked = 0
+        self._orders_gap = 0
         positions: dict[int, Position] = {
             int(n): copy.copy(p) for n, p in (initial_positions or {}).items()
         }
@@ -347,13 +395,57 @@ class BacktestEngine:
             trades, equity_curve, self.starting_capital, self.ticks_per_year,
         )
 
+        self._warn_known_traps(trades)
+
         return BacktestResults(
             stats=stats,
             trades=trades,
             equity_curve=equity_curve,
             positions_at_end=positions,
             identity_guard_active=identity_known,
+            orders_checked=self._orders_checked,
+            orders_on_inconsistent_reserves=self._orders_gap,
         )
+
+    def _warn_known_traps(self, trades: list[dict]) -> None:
+        """Warn about two measured, silent ways a backtest result goes wrong.
+
+        1. Stale reserves: a large share of orders were placed on reserves whose
+           implied price differs from the tick price (fills use the reserves).
+        2. Same seed, few fills: many near-single-trade runs under one
+           realism seed replay one set of random draws.
+        Both are heuristics that only warn; nothing is changed.
+        """
+        if (self._orders_checked >= RESERVE_GAP_MIN_ORDERS
+                and self._orders_gap / self._orders_checked > RESERVE_GAP_SHARE_WARN):
+            warnings.warn(
+                f"BacktestEngine: {self._orders_gap} of {self._orders_checked} orders "
+                f"({100 * self._orders_gap / self._orders_checked:.0f}%) were placed on pool "
+                f"reserves whose implied price differs from the tick price by more than "
+                f"{100 * RESERVE_GAP_TOL:.0f}%. The engine fills from the reserves, so these "
+                "fills are mispriced (typical cause: hourly prices paired with daily reserves, "
+                "as in load_parquet_ticks with reserves='raw'). Use contemporaneous reserves "
+                "(SDK ticks) or reserves='rescale'. See docs/known_traps.md.",
+                RuntimeWarning, stacklevel=3,
+            )
+        seed = self.realism_rng_seed
+        if seed is not None:
+            fills = sum(1 for t in trades if t.get("status") != "failed")
+            if fills <= FEW_FILL_MAX:
+                n = _SEED_FEW_FILL_RUNS.get(seed, 0) + 1
+                _SEED_FEW_FILL_RUNS[seed] = n
+                if n >= SAME_SEED_WARN_AFTER and seed not in _SEED_WARNED:
+                    _SEED_WARNED.add(seed)
+                    warnings.warn(
+                        f"BacktestEngine: {n} runs with at most {FEW_FILL_MAX} fills each have used "
+                        f"realism_rng_seed={seed} in this process. Each engine replays the same "
+                        "realism draws, so averaging such runs averages one draw, not many, and "
+                        "biases returns (measured about +0.4 percentage points per one-trade run "
+                        "under seed 0). Give each independent run its own seed: "
+                        "bt_trading_tools.backtest.panel.seeded_engine_factory, or use "
+                        "panel_forward_returns. See docs/known_traps.md.",
+                        RuntimeWarning, stacklevel=3,
+                    )
 
     # ── Subnet identity ──────────────────────────────────────────
 
@@ -424,6 +516,13 @@ class BacktestEngine:
         st = tick.subnets.get(order.netuid)
         if st is None:
             return None
+
+        # Reserve-vs-price consistency: the fill uses the reserves, so a tick
+        # whose reserves imply a different price than ``st.price`` is mispriced.
+        if st.price > 0 and st.alpha_pool > 0 and st.tao_pool > 0:
+            self._orders_checked += 1
+            if abs(st.tao_pool / st.alpha_pool / st.price - 1.0) > RESERVE_GAP_TOL:
+                self._orders_gap += 1
 
         if order.side == "buy":
             return self._execute_buy(order, st, tick, capital, positions, trades)

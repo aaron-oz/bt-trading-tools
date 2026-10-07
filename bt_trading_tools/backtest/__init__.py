@@ -18,8 +18,10 @@ Usage::
 from bt_trading_tools.backtest.engine import BacktestEngine, BacktestResults
 from bt_trading_tools.backtest.panel import (
     ScheduledBasketStrategy,
+    derive_window_seed,
     panel_forward_returns,
     run_basket_window,
+    seeded_engine_factory,
     slice_ticks,
 )
 from bt_trading_tools.backtest.types import (
@@ -65,4 +67,6 @@ __all__ = [
     "panel_forward_returns",
     "run_basket_window",
     "slice_ticks",
+    "derive_window_seed",
+    "seeded_engine_factory",
 ]

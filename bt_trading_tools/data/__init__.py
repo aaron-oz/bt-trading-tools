@@ -29,6 +29,8 @@ from .ticks import (
     coerce_to_utc_timestamp,
     load_parquet_ticks,
     load_sdk_ticks,
+    reserve_price_gap,
+    rescale_reserves_to_price,
     to_unix_seconds,
 )
 
@@ -44,6 +46,8 @@ __all__ = [
     "coerce_to_utc_timestamp",
     "load_parquet_ticks",
     "load_sdk_ticks",
+    "reserve_price_gap",
+    "rescale_reserves_to_price",
     "to_unix_seconds",
     "FUNDING_COLUMNS",
     "KLINE_COLUMNS",
