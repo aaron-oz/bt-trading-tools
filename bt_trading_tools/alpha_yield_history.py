@@ -41,7 +41,13 @@ from typing import Iterable, Optional, Union
 
 import pandas as pd
 
-from bt_trading_tools.alpha_yield import MAX_PLAUSIBLE_RATE_PER_DAY
+from bt_trading_tools.alpha_yield import (
+    MAX_PLAUSIBLE_RATE_PER_DAY,
+    _warn_rejected,
+    generation_end,
+    implausible_rate,
+    normalize_reregistrations,
+)
 
 DAY_S = 86400.0
 HISTORY_COLUMNS = ["date", "netuid", "hotkey", "stake_rao", "thirty_day_apy",
@@ -94,10 +100,19 @@ class HistoricalYieldModel:
             (the validator-selection cache is refreshed daily and may be up to
             a day old). Default 0.
         max_rate_per_day: rates above this are treated as data errors (0.0).
+            The number of such rows is in ``self.rejected_rate_rows`` and is
+            reported once as a ``UserWarning`` at construction.
+        reregistrations: optional ``{netuid: [timestamps]}`` (output of
+            ``bt_trading_tools.utils.lifecycle.reregistrations_from_pool_history``).
+            When given, accrual stops at the first re-registration of the
+            netuid after ``entry_time``, and the rate used is the one in force
+            the day before that re-registration, so a position never earns the
+            rate of the unrelated subnet that later took its slot.
     """
 
     def __init__(self, rate_table: pd.DataFrame, convention: str = "sale_rate",
-                 lag_days: int = 0, max_rate_per_day: float = MAX_PLAUSIBLE_RATE_PER_DAY):
+                 lag_days: int = 0, max_rate_per_day: float = MAX_PLAUSIBLE_RATE_PER_DAY,
+                 reregistrations=None):
         if convention not in ("sale_rate", "integrated"):
             raise ValueError(f"convention must be 'sale_rate' or 'integrated', got {convention!r}")
         self.convention = convention
@@ -105,9 +120,19 @@ class HistoricalYieldModel:
         self.max_rate = max_rate_per_day
         self._days: dict[int, list[int]] = {}
         self._rates: dict[int, list[float]] = {}
+        self.rejected_rate_rows = 0
+        self.rejected_examples: list = []
         for netuid, g in rate_table.sort_values(["netuid", "date"]).groupby("netuid"):
             self._days[int(netuid)] = [int(d.timestamp() // DAY_S) for d in g["date"]]
             self._rates[int(netuid)] = [float(r) for r in g["rate_per_day"]]
+            for d, r in zip(g["date"], self._rates[int(netuid)]):
+                if implausible_rate(r, self.max_rate):
+                    self.rejected_rate_rows += 1
+                    if len(self.rejected_examples) < 20:
+                        self.rejected_examples.append((int(netuid), str(d.date()), r))
+        self._reregs = normalize_reregistrations(reregistrations)
+        _warn_rejected("HistoricalYieldModel", self.rejected_rate_rows,
+                       self.rejected_examples)
 
     def rate_on(self, netuid: int, unix_ts: float) -> float:
         """The rate in force on the date of ``unix_ts`` (minus ``lag_days``);
@@ -120,7 +145,7 @@ class HistoricalYieldModel:
         if i < 0:
             return 0.0
         r = self._rates[int(netuid)][i]
-        if not math.isfinite(r) or r < 0 or r > self.max_rate:
+        if implausible_rate(r, self.max_rate):
             return 0.0
         return r
 
@@ -128,11 +153,17 @@ class HistoricalYieldModel:
         """Alpha accrued on ``alpha_qty`` held from ``entry_time`` to ``now`` (unix seconds)."""
         if alpha_qty <= 0 or not math.isfinite(alpha_qty) or now <= entry_time:
             return 0.0
+        end = generation_end(self._reregs, netuid, float(entry_time), float(now))
+        # Last instant whose daily rate certainly belongs to the entry's
+        # generation: the end itself, or the day before the rebirth day.
+        last_safe = end if end >= now else (end // DAY_S) * DAY_S - 1.0
+        if end <= entry_time:
+            return 0.0
         if self.convention == "sale_rate":
-            return alpha_qty * self.rate_on(netuid, now) * (now - entry_time) / DAY_S
+            return alpha_qty * self.rate_on(netuid, last_safe) * (end - entry_time) / DAY_S
         total, t = 0.0, float(entry_time)
-        while t < now:                                   # walk day boundaries
-            nxt = min(now, (t // DAY_S + 1) * DAY_S)
-            total += self.rate_on(netuid, t) * (nxt - t) / DAY_S
+        while t < end:                                   # walk day boundaries
+            nxt = min(end, (t // DAY_S + 1) * DAY_S)
+            total += self.rate_on(netuid, min(t, last_safe)) * (nxt - t) / DAY_S
             t = nxt
         return alpha_qty * total
