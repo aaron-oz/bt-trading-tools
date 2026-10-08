@@ -249,3 +249,36 @@ def test_reregistrations_from_csvs_finds_a_staked_alpha_collapse(tmp_path):
     df.to_csv(f, index=False)
     ev = reregistrations_from_csvs(f)
     assert list(ev) == [7] and ev[7][0] == t[3]
+
+
+# ---------- trap 2b: custom builders (shared rescale helper) ----------
+
+
+def test_rescale_tick_reserves_matches_loader_transform():
+    from bt_trading_tools.data import rescale_tick_reserves
+
+    ticks = flat_ticks(gap=-0.2)
+    before = [(st.tao_pool, st.alpha_pool, st.price)
+              for t in ticks for st in t.subnets.values()]
+    assert reserve_price_gap(ticks)["median_abs_gap"] > 0.15
+    out = rescale_tick_reserves(ticks)
+    assert out is ticks
+    after = [(st.tao_pool, st.alpha_pool) for t in ticks for st in t.subnets.values()]
+    for (tao0, alpha0, price), (tao1, alpha1) in zip(before, after):
+        assert (tao1, alpha1) == pytest.approx(rescale_reserves_to_price(tao0, alpha0, price))
+        assert tao1 * alpha1 == pytest.approx(tao0 * alpha0)      # depth (k) kept
+    g = reserve_price_gap(ticks)
+    assert g["max_abs_gap"] < 1e-9 and g["p90_abs_gap"] < 1e-9
+    st = ticks[0].subnets[7]
+    assert st.signals["reserve_gap_raw"] == pytest.approx(-0.2, abs=1e-9)
+
+
+def test_rescale_tick_reserves_keeps_builder_gap_signal_and_skips_bad_rows():
+    from bt_trading_tools.data import rescale_tick_reserves
+
+    ticks = flat_ticks(gap=-0.2)
+    ticks[0].subnets[7].signals["reserve_gap_raw"] = 0.123
+    ticks[1].subnets[7].alpha_pool = 0.0
+    rescale_tick_reserves(ticks)
+    assert ticks[0].subnets[7].signals["reserve_gap_raw"] == 0.123
+    assert ticks[1].subnets[7].alpha_pool == 0.0

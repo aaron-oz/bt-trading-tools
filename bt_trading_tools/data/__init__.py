@@ -31,6 +31,7 @@ from .ticks import (
     load_sdk_ticks,
     reserve_price_gap,
     rescale_reserves_to_price,
+    rescale_tick_reserves,
     to_unix_seconds,
 )
 
@@ -48,6 +49,7 @@ __all__ = [
     "load_sdk_ticks",
     "reserve_price_gap",
     "rescale_reserves_to_price",
+    "rescale_tick_reserves",
     "to_unix_seconds",
     "FUNDING_COLUMNS",
     "KLINE_COLUMNS",

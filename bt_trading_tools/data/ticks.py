@@ -186,12 +186,52 @@ def rescale_reserves_to_price(tao_pool: float, alpha_pool: float, price: float) 
     return math.sqrt(k * price), math.sqrt(k / price)
 
 
+def rescale_tick_reserves(ticks: list) -> list:
+    """Rescale every SubnetTick's reserves to its own ``price``, in place.
+
+    For CUSTOM tick builders that pair an intra-day price (for example an
+    hourly OHLCV close) with a less frequent pool snapshot (for example daily
+    ``pool_history`` reserves, forward-filled). ``BacktestEngine`` fills from
+    ``tao_pool`` / ``alpha_pool``, not from ``price``, so stale reserves
+    misprice every fill. This applies the same per-subnet transform that
+    ``load_parquet_ticks(reserves="rescale")`` applies
+    (``rescale_reserves_to_price``: keep k = tao x alpha, move the implied
+    price to ``price``).
+
+    Depth caveat: rescaling matches PRICE, not DEPTH. k still comes from the
+    old snapshot, so any change in pool depth since then (a surge of new TAO,
+    a large unstake) is not captured, and price impact of a fill is computed
+    against the old depth. Where depth matters (surges, large orders) use
+    SDK ticks (``load_sdk_ticks``) instead. Like ``reserves="rescale"`` in
+    the loader, this is an opt-in experiment, not a validated fix: on active
+    strategies rescaling moved results by orders of magnitude (see
+    docs/known_traps.md, "Why rescale is not the default").
+
+    Each rescaled subnet's ``signals`` gets ``reserve_gap_raw`` (implied
+    price before rescaling / price - 1) unless the builder already set it.
+    Subnets with non-positive price or reserves are left unchanged. Run
+    ``reserve_price_gap`` before calling this to see how stale the builder's
+    reserves were. Returns the same list for chaining.
+    """
+    for t in ticks:
+        for st in t.subnets.values():
+            if not (st.price > 0 and st.tao_pool > 0 and st.alpha_pool > 0):
+                continue
+            gap_raw = st.tao_pool / st.alpha_pool / st.price - 1.0
+            st.tao_pool, st.alpha_pool = rescale_reserves_to_price(
+                st.tao_pool, st.alpha_pool, st.price)
+            if st.signals is None:
+                st.signals = {}
+            st.signals.setdefault("reserve_gap_raw", gap_raw)
+    return ticks
+
+
 def reserve_price_gap(ticks: Iterable) -> dict:
     """How far the pool-implied price (tao_pool / alpha_pool) is from each tick's own price.
 
     The engine fills from the reserves, so a large gap means mispriced fills.
     Accepts a list of ``TickData``. Returns ``{"n", "median_abs_gap",
-    "share_over_2pct", "share_over_5pct", "max_abs_gap"}`` over every
+    "p90_abs_gap", "share_over_2pct", "share_over_5pct", "max_abs_gap"}`` over every
     (tick, subnet) with positive price and reserves. On the SDK feed the
     median is about 0.005% and under 1% of subnet-ticks exceed 5%
     (measured 2026-10); a median above about 1% or a share over 5% above
@@ -203,10 +243,12 @@ def reserve_price_gap(ticks: Iterable) -> dict:
             if st.price > 0 and st.alpha_pool > 0 and st.tao_pool > 0:
                 gaps.append(abs(st.tao_pool / st.alpha_pool / st.price - 1.0))
     if not gaps:
-        return {"n": 0, "median_abs_gap": float("nan"), "share_over_2pct": float("nan"),
+        return {"n": 0, "median_abs_gap": float("nan"), "p90_abs_gap": float("nan"),
+                "share_over_2pct": float("nan"),
                 "share_over_5pct": float("nan"), "max_abs_gap": float("nan")}
     s = pd.Series(gaps)
-    return {"n": int(len(s)), "median_abs_gap": float(s.median()), "share_over_2pct": float((s > 0.02).mean()),
+    return {"n": int(len(s)), "median_abs_gap": float(s.median()),
+            "p90_abs_gap": float(s.quantile(0.90)), "share_over_2pct": float((s > 0.02).mean()),
             "share_over_5pct": float((s > 0.05).mean()), "max_abs_gap": float(s.max())}
 
 
@@ -394,6 +436,7 @@ __all__ = [
     "to_unix_seconds",
     "coerce_to_utc_timestamp",
     "rescale_reserves_to_price",
+    "rescale_tick_reserves",
     "reserve_price_gap",
     "load_sdk_ticks",
     "load_parquet_ticks",
