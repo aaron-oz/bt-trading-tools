@@ -75,6 +75,8 @@ SAME_SEED_WARN_AFTER = 25
 FEW_FILL_MAX = 4
 _SEED_FEW_FILL_RUNS: dict[int, int] = {}
 _SEED_WARNED: set[int] = set()
+# Default-yield-cascade configurations already announced in this process.
+_CASCADE_WARNED: set = set()
 
 
 # Default flat-fee constants — used only when fee_model=None and no chain
@@ -199,10 +201,23 @@ class BacktestEngine:
         # cascade fast-fails to zero — same effective behavior as the
         # historical default, but safe-by-default in production usage.
         if yield_model is None:
-            from bt_trading_tools.alpha_yield import build_default_yield_model
+            from bt_trading_tools.alpha_yield import (
+                build_default_yield_model, default_yield_cascade_warning,
+                describe_default_yield_cascade)
             self.yield_model = build_default_yield_model()
+            # Which tier wins depends on the shell (env vars, cache files),
+            # and every non-zero tier is a rate as of now. Say so once per
+            # distinct configuration per process (docs/known_traps.md).
+            desc = describe_default_yield_cascade()
+            key = (tuple(desc["tiers"]), desc["validator_cache_path"])
+            self.default_yield_cascade = desc
+            if key not in _CASCADE_WARNED:
+                _CASCADE_WARNED.add(key)
+                warnings.warn(default_yield_cascade_warning(desc),
+                              UserWarning, stacklevel=2)
         else:
             self.yield_model = yield_model
+            self.default_yield_cascade = None
         self.uses_proxy = uses_proxy
         self.realism_rng_seed = realism_rng_seed
         self._realism = RealismSimulator(

@@ -806,6 +806,77 @@ def _resolve_validator_cache_path():
     return None
 
 
+# Tier names reported by describe_default_yield_cascade.
+TIER_VALIDATOR_CACHE = "validator_cache"
+TIER_TAOSTATS_LIVE = "taostats_live"
+TIER_CHAIN_LIVE = "chain_live"
+TIER_EMPIRICAL = "empirical"
+TIER_ZERO = "zero"
+
+
+def describe_default_yield_cascade() -> dict:
+    """Which tiers ``build_default_yield_model()`` would configure right now.
+
+    Read-only: inspects the same environment variables and paths as
+    ``build_default_yield_model`` without constructing providers or making
+    network calls. Returns::
+
+        {"tiers": [tier names in cascade order, "zero" last],
+         "primary": first tier able to answer (the one most subnets will use),
+         "validator_cache_path": str or None,
+         "not_point_in_time": True unless primary is "zero"}
+
+    ``primary`` is a configuration statement, not an observation: a tier can
+    still fail for a given subnet and fall through to the next one
+    (``CascadingYieldProvider.instrumentation_snapshot`` reports what was
+    actually used). Every tier except "zero" returns a rate as of NOW (the
+    validator cache file's last refresh, today's taostats or chain state, or
+    the trailing window at the END of the empirical CSV), so on a historical
+    backtest window the credited yield is not point-in-time. For
+    point-in-time rates use ``bt_trading_tools.alpha_yield_history``.
+    """
+    import os
+    from pathlib import Path
+
+    tiers: list[str] = []
+    cache_path = _resolve_validator_cache_path()
+    if cache_path is not None:
+        tiers.append(TIER_VALIDATOR_CACHE)
+    if os.environ.get("TAOSTATS_API_KEY"):
+        tiers.append(TIER_TAOSTATS_LIVE)
+    if os.environ.get("BT_NETWORK"):
+        tiers.append(TIER_CHAIN_LIVE)
+    data_dir = os.environ.get("TAOSTATS_DATA_DIR")
+    if data_dir and Path(data_dir).exists():
+        tiers.append(TIER_EMPIRICAL)
+    tiers.append(TIER_ZERO)
+    return {
+        "tiers": tiers,
+        "primary": tiers[0],
+        "validator_cache_path": str(cache_path) if cache_path is not None else None,
+        "not_point_in_time": tiers[0] != TIER_ZERO,
+    }
+
+
+def default_yield_cascade_warning(desc: dict) -> str:
+    """Human-readable warning text for a ``describe_default_yield_cascade`` result."""
+    where = (f" ({desc['validator_cache_path']})"
+             if desc["primary"] == TIER_VALIDATOR_CACHE else "")
+    msg = (f"yield_model=None resolved through the environment-dependent default cascade: "
+           f"primary tier '{desc['primary']}'{where}; configured tiers {desc['tiers']}. "
+           "The tier depends on VALIDATOR_CACHE_PATH / validator-cache files, "
+           "TAOSTATS_API_KEY, BT_NETWORK and TAOSTATS_DATA_DIR, so the same script "
+           "credits different yield in different shells and machines.")
+    if desc["not_point_in_time"]:
+        msg += (" Every non-zero tier returns a rate as of NOW (or the end of the CSV), "
+                "so on a historical window the yield is lookahead-ish. For point-in-time "
+                "rates pass yield_model=bt_trading_tools.alpha_yield_history."
+                "HistoricalYieldModel(...).")
+    else:
+        msg += " No rate source is configured, so yield is ZERO."
+    return msg + " Pass yield_model explicitly to silence this. See docs/known_traps.md."
+
+
 def build_default_yield_model() -> "AlphaYieldModel":
     """Construct an ``AlphaYieldModel`` with an env-driven cascade.
 
