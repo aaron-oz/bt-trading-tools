@@ -72,6 +72,16 @@ class Order:
     # Bug #4: this bug caused +164,605% phantom returns.
     limit_price: float | None = None  # For sells: cap effective price (TP overshoot prevention)
                                        # For buys: max price willing to pay (slippage protection)
+    # Hybrid execution (decide on one pool, execute on another). A paper bot
+    # that sizes an order on a stale data-feed pool and then executes against
+    # the live pool measures exec_slippage_pct = (decision fill - live fill) /
+    # decision fill and fails the order when that exceeds the realism layer's
+    # rate tolerance. Set both to the pool the decision was made on and the
+    # engine does the same against the tick's pool (which plays the live pool):
+    # the CSV slippage-noise layer is skipped, as on the paper live-fetch path.
+    # None (default) = decision pool is the tick pool, the previous behavior.
+    decision_tao_pool: float | None = None
+    decision_alpha_pool: float | None = None
 
 
 @runtime_checkable
