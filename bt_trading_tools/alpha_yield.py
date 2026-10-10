@@ -806,6 +806,77 @@ def _resolve_validator_cache_path():
     return None
 
 
+# Tier names reported by describe_default_yield_cascade.
+TIER_VALIDATOR_CACHE = "validator_cache"
+TIER_TAOSTATS_LIVE = "taostats_live"
+TIER_CHAIN_LIVE = "chain_live"
+TIER_EMPIRICAL = "empirical"
+TIER_ZERO = "zero"
+
+
+def describe_default_yield_cascade() -> dict:
+    """Which tiers ``build_default_yield_model()`` would configure right now.
+
+    Read-only: inspects the same environment variables and paths as
+    ``build_default_yield_model`` without constructing providers or making
+    network calls. Returns::
+
+        {"tiers": [tier names in cascade order, "zero" last],
+         "primary": first tier able to answer (the one most subnets will use),
+         "validator_cache_path": str or None,
+         "not_point_in_time": True unless primary is "zero"}
+
+    ``primary`` is a configuration statement, not an observation: a tier can
+    still fail for a given subnet and fall through to the next one
+    (``CascadingYieldProvider.instrumentation_snapshot`` reports what was
+    actually used). Every tier except "zero" returns a rate as of NOW (the
+    validator cache file's last refresh, today's taostats or chain state, or
+    the trailing window at the END of the empirical CSV), so on a historical
+    backtest window the credited yield is not point-in-time. For
+    point-in-time rates use ``bt_trading_tools.alpha_yield_history``.
+    """
+    import os
+    from pathlib import Path
+
+    tiers: list[str] = []
+    cache_path = _resolve_validator_cache_path()
+    if cache_path is not None:
+        tiers.append(TIER_VALIDATOR_CACHE)
+    if os.environ.get("TAOSTATS_API_KEY"):
+        tiers.append(TIER_TAOSTATS_LIVE)
+    if os.environ.get("BT_NETWORK"):
+        tiers.append(TIER_CHAIN_LIVE)
+    data_dir = os.environ.get("TAOSTATS_DATA_DIR")
+    if data_dir and Path(data_dir).exists():
+        tiers.append(TIER_EMPIRICAL)
+    tiers.append(TIER_ZERO)
+    return {
+        "tiers": tiers,
+        "primary": tiers[0],
+        "validator_cache_path": str(cache_path) if cache_path is not None else None,
+        "not_point_in_time": tiers[0] != TIER_ZERO,
+    }
+
+
+def default_yield_cascade_warning(desc: dict) -> str:
+    """Human-readable warning text for a ``describe_default_yield_cascade`` result."""
+    where = (f" ({desc['validator_cache_path']})"
+             if desc["primary"] == TIER_VALIDATOR_CACHE else "")
+    msg = (f"yield_model=None resolved through the environment-dependent default cascade: "
+           f"primary tier '{desc['primary']}'{where}; configured tiers {desc['tiers']}. "
+           "The tier depends on VALIDATOR_CACHE_PATH / validator-cache files, "
+           "TAOSTATS_API_KEY, BT_NETWORK and TAOSTATS_DATA_DIR, so the same script "
+           "credits different yield in different shells and machines.")
+    if desc["not_point_in_time"]:
+        msg += (" Every non-zero tier returns a rate as of NOW (or the end of the CSV), "
+                "so on a historical window the yield is lookahead-ish. For point-in-time "
+                "rates pass yield_model=bt_trading_tools.alpha_yield_history."
+                "HistoricalYieldModel(...).")
+    else:
+        msg += " No rate source is configured, so yield is ZERO."
+    return msg + " Pass yield_model explicitly to silence this. See docs/known_traps.md."
+
+
 def build_default_yield_model() -> "AlphaYieldModel":
     """Construct an ``AlphaYieldModel`` with an env-driven cascade.
 
@@ -980,6 +1051,69 @@ def _first_record(payload) -> dict:
     raise ValueError(f"unexpected taostats payload shape: {type(payload)}")
 
 
+def implausible_rate(rate: float, max_rate_per_day: float = MAX_PLAUSIBLE_RATE_PER_DAY) -> bool:
+    """True when a per-day yield rate must be treated as a data error.
+
+    The rule ``AlphaYieldModel.rate`` applies to provider quotes, shared here
+    so the duck-typed yield models (``HistoricalSubnetYieldModel`` and
+    ``bt_trading_tools.alpha_yield_history.HistoricalYieldModel``) reject the
+    same rates: negative, non-finite, or above ``max_rate_per_day``.
+    """
+    try:
+        r = float(rate)
+    except (TypeError, ValueError):
+        return True
+    return (not _finite(r)) or r < 0.0 or r > max_rate_per_day
+
+
+def normalize_reregistrations(reregistrations) -> dict[int, list[float]]:
+    """``{netuid: [timestamps]}`` -> ``{netuid: sorted unix seconds}``.
+
+    Accepts the output of ``bt_trading_tools.utils.lifecycle.find_reregistrations``
+    / ``reregistrations_from_pool_history`` (pandas Timestamps) or plain unix
+    seconds. ``None`` gives an empty mapping.
+    """
+    out: dict[int, list[float]] = {}
+    if not reregistrations:
+        return out
+    for netuid, ts in reregistrations.items():
+        vals = []
+        for t in ts:
+            vals.append(float(t.timestamp()) if hasattr(t, "timestamp") else float(t))
+        if vals:
+            out[int(netuid)] = sorted(vals)
+    return out
+
+
+def generation_end(reregs: dict[int, list[float]], netuid: int,
+                   entry_time: float, now: float) -> float:
+    """Clip ``now`` to the first re-registration of ``netuid`` after ``entry_time``.
+
+    A position opened in one subnet generation stops earning yield when that
+    subnet deregisters; the slot's later rates belong to an unrelated subnet.
+    With no re-registration in ``(entry_time, now]`` returns ``now``.
+    """
+    cuts = reregs.get(int(netuid))
+    if not cuts:
+        return now
+    import bisect as _bisect
+    i = _bisect.bisect_right(cuts, float(entry_time))
+    if i < len(cuts) and cuts[i] <= now:
+        return cuts[i]
+    return now
+
+
+def _warn_rejected(model_name: str, n: int, examples: list) -> None:
+    if n <= 0:
+        return
+    import warnings as _warnings
+    msg = (f"{model_name}: {n} rate row(s) were negative, non-finite or above "
+           f"the plausibility ceiling and were set to 0.0 (examples: {examples[:5]}). "
+           "See bt_trading_tools/docs/known_traps.md (duck-typed yield models).")
+    logger.warning(msg)
+    _warnings.warn(msg, UserWarning, stacklevel=3)
+
+
 class HistoricalSubnetYieldModel:
     """Engine-compatible yield model backed by a historical per-subnet APY CSV.
 
@@ -987,12 +1121,32 @@ class HistoricalSubnetYieldModel:
     (generic infrastructure; the CSV schema, not the class, carries any
     research specifics). Implements the duck-typed
     ``accrued_yield(netuid, alpha_qty, entry_time, now)`` interface that
-    ``BacktestEngine._accrued_yield`` calls, with a time-VARYING daily rate —
-    unlike the trailing-window-constant providers above, this reflects each
+    ``BacktestEngine._accrued_yield`` calls, with a time-VARYING daily rate,
+    unlike the trailing-window-constant providers above: this reflects each
     day's actual rate over a backtest window.
 
     CSV schema: columns ``netuid``, ``date`` (parseable, UTC), ``gross_apy``
-    (annualized). Rows with missing/negative APY are dropped.
+    (annualized). Rows with missing APY are dropped.
+
+    Plausibility (added 2026-10-08). The daily rate is ``gross_apy / 365``.
+    A daily rate that is negative, non-finite, or above ``max_rate_per_day``
+    (default ``MAX_PLAUSIBLE_RATE_PER_DAY`` = 0.02/day) is set to 0.0 for
+    that day, the same rule ``AlphaYieldModel.rate`` applies to provider
+    quotes. Before this, only negative rows were dropped and a high row was
+    credited in full (for example netuid 49 on 2025-11-21 at gross APY 58.5,
+    about 0.16/day, in one research CSV). The count is in
+    ``self.rejected_rate_rows`` and is reported once as a ``UserWarning``.
+
+    Generation awareness (optional). Pass ``reregistrations`` (the
+    ``{netuid: [timestamps]}`` output of
+    ``bt_trading_tools.utils.lifecycle.reregistrations_from_pool_history`` or
+    ``find_reregistrations``) and accrual stops at the first re-registration
+    of the netuid after ``entry_time``: a position never earns the rates of
+    the unrelated subnet that later took its slot. Without it the model is
+    keyed by bare netuid, as before. The engine's own rebirth handling
+    (stamped ticks, see ``stamp_generations``) already closes such positions
+    at the deregistration refund; this argument protects runs on unstamped
+    ticks and custom loops.
 
     Args:
         csv_path: path to the per-subnet daily yield CSV.
@@ -1001,23 +1155,44 @@ class HistoricalSubnetYieldModel:
             cum-rate difference, dropping earlier rows does not change
             results for trades after the floor; it makes the guarantee
             literal.
+        max_rate_per_day: plausibility ceiling, per day.
+        reregistrations: optional ``{netuid: [timestamps]}``, see above.
     """
 
-    def __init__(self, csv_path, floor_date: "str | None" = None):
+    def __init__(self, csv_path, floor_date: "str | None" = None,
+                 max_rate_per_day: float = MAX_PLAUSIBLE_RATE_PER_DAY,
+                 reregistrations=None):
+        import numpy as _np
         import pandas as _pd
 
         df = _pd.read_csv(csv_path)
         df["date"] = _pd.to_datetime(df["date"], utc=True)
-        df = df[df["gross_apy"].notna() & (df["gross_apy"] >= 0)]
+        df = df[df["gross_apy"].notna()].copy()
         if floor_date is not None:
             df = df[df["date"] >= _pd.Timestamp(floor_date, tz="UTC")]
-        df["daily_rate"] = df["gross_apy"] / 365.0
+        df["daily_rate"] = df["gross_apy"].astype(float) / 365.0
+        r = df["daily_rate"].to_numpy()
+        bad = ~_np.isfinite(r) | (r < 0.0) | (r > max_rate_per_day)
+        # Negative rows were silently dropped before (equivalent to 0.0 in a
+        # cum-sum); they are not counted, so the warning flags new behavior.
+        loud = bad & ~(_np.isfinite(r) & (r < 0.0))
+        self.max_rate_per_day = max_rate_per_day
+        self.rejected_rate_rows = int(loud.sum())
+        self.rejected_examples = [
+            (int(n), str(d.date()), float(x))
+            for n, d, x in df.loc[loud, ["netuid", "date", "daily_rate"]]
+            .itertuples(index=False)
+        ][:20]
+        df.loc[bad, "daily_rate"] = 0.0
         df = df.sort_values(["netuid", "date"]).reset_index(drop=True)
         df["cum_rate"] = df.groupby("netuid")["daily_rate"].cumsum()
         self._lookup = {
             int(netuid): grp.set_index("date")["cum_rate"]
             for netuid, grp in df.groupby("netuid")
         }
+        self._reregs = normalize_reregistrations(reregistrations)
+        _warn_rejected("HistoricalSubnetYieldModel", self.rejected_rate_rows,
+                       self.rejected_examples)
 
     def _cum_at(self, series, ts: float) -> float:
         import pandas as _pd
@@ -1032,5 +1207,12 @@ class HistoricalSubnetYieldModel:
         series = self._lookup.get(int(netuid))
         if series is None or alpha_qty <= 0:
             return 0.0
-        rate = self._cum_at(series, float(now)) - self._cum_at(series, float(entry_time))
+        end = generation_end(self._reregs, netuid, float(entry_time), float(now))
+        if end < float(now):
+            # Clipped at a rebirth: the daily row dated on the rebirth day may
+            # describe either subnet, so stop before that day's row.
+            end = (end // 86400.0) * 86400.0 - 1.0
+        if end <= float(entry_time):
+            return 0.0
+        rate = self._cum_at(series, end) - self._cum_at(series, float(entry_time))
         return max(0.0, alpha_qty * rate)

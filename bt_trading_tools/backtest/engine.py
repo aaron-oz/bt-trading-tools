@@ -63,6 +63,12 @@ class BacktestResults:
 # around surges (measured 2026-10: pool-implied price averaged 0.92 x the
 # tick price at surge entries).
 RESERVE_GAP_TOL = 0.05
+
+
+def _hybrid(order: Order) -> bool:
+    """True when the order names a decision pool different in kind from the fill pool."""
+    return bool(order.decision_tao_pool and order.decision_alpha_pool
+                and order.decision_tao_pool > 0 and order.decision_alpha_pool > 0)
 RESERVE_GAP_SHARE_WARN = 0.10
 RESERVE_GAP_MIN_ORDERS = 10
 
@@ -75,6 +81,8 @@ SAME_SEED_WARN_AFTER = 25
 FEW_FILL_MAX = 4
 _SEED_FEW_FILL_RUNS: dict[int, int] = {}
 _SEED_WARNED: set[int] = set()
+# Default-yield-cascade configurations already announced in this process.
+_CASCADE_WARNED: set = set()
 
 
 # Default flat-fee constants — used only when fee_model=None and no chain
@@ -199,10 +207,23 @@ class BacktestEngine:
         # cascade fast-fails to zero — same effective behavior as the
         # historical default, but safe-by-default in production usage.
         if yield_model is None:
-            from bt_trading_tools.alpha_yield import build_default_yield_model
+            from bt_trading_tools.alpha_yield import (
+                build_default_yield_model, default_yield_cascade_warning,
+                describe_default_yield_cascade)
             self.yield_model = build_default_yield_model()
+            # Which tier wins depends on the shell (env vars, cache files),
+            # and every non-zero tier is a rate as of now. Say so once per
+            # distinct configuration per process (docs/known_traps.md).
+            desc = describe_default_yield_cascade()
+            key = (tuple(desc["tiers"]), desc["validator_cache_path"])
+            self.default_yield_cascade = desc
+            if key not in _CASCADE_WARNED:
+                _CASCADE_WARNED.add(key)
+                warnings.warn(default_yield_cascade_warning(desc),
+                              UserWarning, stacklevel=2)
         else:
             self.yield_model = yield_model
+            self.default_yield_cascade = None
         self.uses_proxy = uses_proxy
         self.realism_rng_seed = realism_rng_seed
         self._realism = RealismSimulator(
@@ -615,6 +636,18 @@ class BacktestEngine:
             "decision_pool_tao": st.tao_pool,
             "decision_pool_alpha": st.alpha_pool,
         }
+        if _hybrid(order):
+            # Mirror PaperBotBase.adjust_action_with_live_pool: the order was
+            # sized on the decision pool and fills on this tick's pool.
+            d_fee, _ = self._buy_fee(order.netuid, spend, order.decision_tao_pool,
+                                     order.decision_alpha_pool)
+            d_alpha, _, _ = amm_buy(spend - d_fee, order.decision_tao_pool,
+                                    order.decision_alpha_pool)
+            action["decision_pool_tao"] = order.decision_tao_pool
+            action["decision_pool_alpha"] = order.decision_alpha_pool
+            action["live_spot_price"] = st.price
+            if d_alpha > 0:
+                action["exec_slippage_pct"] = round((d_alpha - alpha_received) / d_alpha * 100, 3)
         self._realism.simulate_fill(action)
         if action.get("status") == "failed":
             failed = self._failed(order, "buy", tick, eff_price,
@@ -718,6 +751,16 @@ class BacktestEngine:
             "decision_pool_tao": use_pool_tao,
             "decision_pool_alpha": use_pool_alpha,
         }
+        if _hybrid(order):
+            d_fee, _ = self._sell_fee(order.netuid, alpha_to_sell, order.decision_tao_pool,
+                                      order.decision_alpha_pool)
+            d_tao = ledger.liquidation_value(alpha_to_sell, order.decision_tao_pool,
+                                             order.decision_alpha_pool, d_fee)
+            sell_action["decision_pool_tao"] = order.decision_tao_pool
+            sell_action["decision_pool_alpha"] = order.decision_alpha_pool
+            sell_action["live_spot_price"] = st.price
+            if d_tao > 0:
+                sell_action["exec_slippage_pct"] = round((d_tao - tao_received) / d_tao * 100, 3)
         self._realism.simulate_fill(sell_action)
         if sell_action.get("status") == "failed":
             failed = self._failed(order, "sell", tick, pos.entry_price,
