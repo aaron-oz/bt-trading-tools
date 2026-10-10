@@ -228,3 +228,24 @@ def test_load_parquet_ticks_rejects_unknown_options(tmp_path, parquet_mod):
         parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, reserves="bogus")
     with pytest.raises(ValueError):
         parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p, bar_label="middle")
+
+
+def test_explicit_reregistrations_stamp_at_event_time_not_floored_to_midnight(tmp_path, parquet_mod):
+    o, p = _write_parquet_fixture(tmp_path)
+    event = pd.Timestamp("2026-01-10 06:30", tz="UTC")
+    ticks = parquet_mod.load_parquet_ticks("2026-01-10", "2026-01-11", ohlcv_parquet=o, pool_parquet=p,
+                                           reregistrations={9: [event]})
+    gens = {t.timestamp: t.subnets[9].generation for t in ticks}
+    assert gens[int(pd.Timestamp("2026-01-10 05:00", tz="UTC").timestamp())] == 0      # before the event: still the old subnet
+    assert gens[int(pd.Timestamp("2026-01-10 07:00", tz="UTC").timestamp())] == 1      # after it: new subnet
+
+
+def test_reregistrations_from_csvs_finds_a_staked_alpha_collapse(tmp_path):
+    from bt_trading_tools.utils.lifecycle import reregistrations_from_csvs
+    t = pd.date_range("2026-01-10", periods=6, freq="15min", tz="UTC")
+    df = pd.DataFrame({"timestamp": t, "netuid": 7, "alpha_in": [100, 100, 100, 50, 50, 50],
+                       "alpha_out": [1000, 1000, 1000, 10, 10, 10]})
+    f = tmp_path / "snap.csv"
+    df.to_csv(f, index=False)
+    ev = reregistrations_from_csvs(f)
+    assert list(ev) == [7] and ev[7][0] == t[3]
