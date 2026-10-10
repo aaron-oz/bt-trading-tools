@@ -222,6 +222,7 @@ def load_parquet_ticks(
     stamp_identity: bool = True,
     reserves: str = "raw",
     bar_label: str = "start",
+    reregistrations=None,
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
@@ -280,6 +281,18 @@ def load_parquet_ticks(
     rows kept), so BacktestEngine can close a position whose netuid was
     re-registered. Dropping startup rows otherwise hides the event and turns
     it into an apparent price jump across a data gap.
+
+    ``reregistrations`` ({netuid: [UTC timestamps]}) replaces the daily
+    detector with exact events, e.g. ``utils.lifecycle.reregistrations_from_csvs``
+    on SDK snapshots where they cover the window. The daily detector dates an
+    event to its day and floors it to midnight, so a position opened earlier on
+    the event day is stamped as the NEW subnet while sitting on the old pool,
+    and the engine never closes it. Measured 2026-10-09 (11 strategy-window
+    cases, HODL depth band, market, cheapest-10, against SDK ticks): mean
+    absolute return error 6.3 points with the daily detector, 2.5 points with
+    SDK events (e.g. SN82, window starting on its event day: +14.5% vs SDK
+    -6.0%, fixed to -5.4%). An event-day blackout (drop the netuid's ticks that
+    day) was tried and did not help (D1 error 29.6 points), so it is not offered.
     """
     from bt_trading_tools.backtest.types import SubnetTick, TickData
 
@@ -295,7 +308,7 @@ def load_parquet_ticks(
             issues.append("daily reserves carried forward under hourly prices (engine fills from the reserves)")
         if bar_label == "start":
             issues.append("each tick carries the price from one hour LATER than its timestamp (bar_label='start')")
-        issues.append("the daily pool-history detector misses some subnet re-registrations that SDK ticks catch")
+        issues.append("re-registrations are dated to the day (floored to midnight): positions opened earlier that day on a re-registered subnet are not closed; pass exact events via reregistrations=")
         warnings.warn(
             "load_parquet_ticks known issues (measured 2026-10): " + "; ".join(issues) + ". "
             "Results from this source can be mispriced or look-ahead biased; prefer SDK ticks where they reach. "
@@ -363,11 +376,14 @@ def load_parquet_ticks(
     if stamp_identity:
         from bt_trading_tools.utils.lifecycle import (
             reregistrations_from_pool_history, stamp_generations)
-        # Pool data is daily: floor events to midnight so no hourly tick on
-        # the event day is attributed to the dead subnet.
-        stamp_generations(
-            ticks, reregistrations_from_pool_history(pool_unfiltered),
-            floor_to_day=True)
+        if reregistrations is not None:
+            stamp_generations(ticks, reregistrations)
+        else:
+            # Pool data is daily: floor events to midnight (see docstring for
+            # the failure this leaves; pass SDK events via `reregistrations`).
+            stamp_generations(
+                ticks, reregistrations_from_pool_history(pool_unfiltered),
+                floor_to_day=True)
     return ticks
 
 

@@ -224,6 +224,25 @@ def reregistrations_from_pool_history(
     return find_reregistrations(daily, collapse_frac=collapse_frac, merge_within_s=0)
 
 
+def reregistrations_from_csvs(
+    paths, collapse_frac: float = 0.80,
+) -> dict[int, list[pd.Timestamp]]:
+    """:func:`find_reregistrations` on SDK pool-state CSV snapshots.
+
+    ``paths`` is one path or a list; files are concatenated and de-duplicated
+    on (timestamp, netuid). Needs columns ``timestamp, netuid, alpha_in,
+    alpha_out``. Event times have the snapshot resolution (15 minutes or
+    finer), much tighter than the daily pool_history rule.
+    """
+    if isinstance(paths, (str, bytes)) or hasattr(paths, "__fspath__"):
+        paths = [paths]
+    cols = ["timestamp", "netuid", "alpha_in", "alpha_out"]
+    df = pd.concat([pd.read_csv(p, usecols=cols) for p in paths])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.drop_duplicates(["timestamp", "netuid"]).sort_values("timestamp")
+    return find_reregistrations(df, collapse_frac=collapse_frac)
+
+
 def stamp_generations(
     ticks: list,
     reregistrations: dict[int, list[pd.Timestamp]],
