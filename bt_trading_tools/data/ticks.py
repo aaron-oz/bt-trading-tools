@@ -186,7 +186,61 @@ def rescale_reserves_to_price(tao_pool: float, alpha_pool: float, price: float) 
     return math.sqrt(k * price), math.sqrt(k / price)
 
 
-def rescale_tick_reserves(ticks: list) -> list:
+# Price-outlier guard (applies on the rescale path; see load_parquet_ticks).
+# A subnet-tick whose price is more than this factor away, in either direction,
+# from the price implied by the reserve snapshot paired with it is dropped.
+# Judgment call, measured 2026-10-09 on 2025-11-14 to 2026-06-26 (651,298
+# non-root subnet-hours from load_parquet_ticks, bar_label="start"):
+# |log(close / implied)| has p99 = log(1.18), p99.9 = log(1.83),
+# p99.99 = log(175). Of the 432 subnet-hours beyond 3x, 362 sit within 2 days of
+# a netuid re-registration or of the end of a subnet's startup mode; of the 611
+# between 1.5x and 3x, 447 are near neither (so a tighter cut would mostly
+# remove ordinary fast moves). See docs/known_traps.md.
+DEFAULT_OUTLIER_MAX_RATIO = 3.0
+# netuid 0 (root) is not a constant-product alpha pool: its price is fixed at
+# 1.0 and its pool_history reserves imply about 4 (ratio about 0.25 on every
+# hour from 2026-04-13), so it is never flagged.
+OUTLIER_EXEMPT_NETUIDS = (0,)
+
+
+def _is_price_outlier(price: float, implied: float, max_ratio: Optional[float]) -> bool:
+    if max_ratio is None:
+        return False
+    if not (price > 0 and implied > 0):
+        return False
+    return abs(math.log(price / implied)) > math.log(max_ratio)
+
+
+def _check_max_ratio(max_ratio) -> None:
+    if max_ratio is not None and not (isinstance(max_ratio, (int, float)) and max_ratio > 1.0):
+        raise ValueError(f"outlier_max_ratio must be a number > 1 or None, got {max_ratio!r}")
+
+
+def _warn_price_outliers(dropped: list, n_total: int, max_ratio: float, where: str) -> None:
+    if not dropped:
+        return
+    nets = sorted({d[1] for d in dropped})
+    worst = sorted(dropped, key=lambda d: -abs(math.log(d[2] / d[3])))[:3]
+    ex = "; ".join(
+        f"netuid {d[1]} at {pd.Timestamp(d[0], unit='s', tz='UTC'):%Y-%m-%d %H:%M} UTC "
+        f"close/implied = {d[2] / d[3]:.4g}" for d in worst)
+    warnings.warn(
+        f"{where}: dropped {len(dropped)} of {n_total} subnet-ticks ({len(nets)} subnets) whose price is more "
+        f"than {max_ratio:g}x away from the price implied by the paired reserve snapshot (worst: {ex}). "
+        "Mostly netuid re-registrations and startup-mode exits, where the snapshot describes a different "
+        "or much deeper pool than the one that printed the price; rescaling would make that price "
+        "fillable. Pass outlier_max_ratio=None to keep them; pass outlier_report=[] to get the list. "
+        "See docs/known_traps.md.",
+        UserWarning, stacklevel=3,
+    )
+
+
+def rescale_tick_reserves(
+    ticks: list,
+    outlier_max_ratio: Optional[float] = DEFAULT_OUTLIER_MAX_RATIO,
+    outlier_report: Optional[list] = None,
+    outlier_exempt_netuids: Iterable[int] = OUTLIER_EXEMPT_NETUIDS,
+) -> list:
     """Rescale every SubnetTick's reserves to its own ``price``, in place.
 
     For CUSTOM tick builders that pair an intra-day price (for example an
@@ -212,17 +266,46 @@ def rescale_tick_reserves(ticks: list) -> list:
     Subnets with non-positive price or reserves are left unchanged. Run
     ``reserve_price_gap`` before calling this to see how stale the builder's
     reserves were. Returns the same list for chaining.
+
+    Outlier guard (on by default, because rescaling is what makes a bad price
+    fillable): a subnet whose ``price`` is more than ``outlier_max_ratio``
+    times away, in either direction, from the price its own reserves imply is
+    REMOVED from that tick instead of rescaled, and a ``UserWarning`` reports
+    the count. Rescaling such a tick would turn a price printed by a different
+    pool (typically the new subnet's tiny bootstrap pool right after a netuid
+    re-registration, paired with the old subnet's deep snapshot) into a deep
+    pool the engine fills and marks at. The test uses only the tick's own
+    price and reserves, so it is causal when the reserves are a snapshot at
+    or before the tick. ``None`` turns it off; ``outlier_report`` (a list)
+    receives one ``(timestamp, netuid, price, implied_price, "ratio")`` tuple
+    per removed subnet; netuids in ``outlier_exempt_netuids`` (default: root,
+    netuid 0) are never removed. The default 3.0 is a judgment call; see
+    ``DEFAULT_OUTLIER_MAX_RATIO``.
     """
+    _check_max_ratio(outlier_max_ratio)
+    exempt = set(outlier_exempt_netuids)
+    dropped: list = []
+    n_total = 0
     for t in ticks:
-        for st in t.subnets.values():
+        for nid in list(t.subnets):
+            st = t.subnets[nid]
+            n_total += 1
             if not (st.price > 0 and st.tao_pool > 0 and st.alpha_pool > 0):
                 continue
-            gap_raw = st.tao_pool / st.alpha_pool / st.price - 1.0
+            implied = st.tao_pool / st.alpha_pool
+            if nid not in exempt and _is_price_outlier(st.price, implied, outlier_max_ratio):
+                dropped.append((int(t.timestamp), int(nid), float(st.price), float(implied), "ratio"))
+                del t.subnets[nid]
+                continue
+            gap_raw = implied / st.price - 1.0
             st.tao_pool, st.alpha_pool = rescale_reserves_to_price(
                 st.tao_pool, st.alpha_pool, st.price)
             if st.signals is None:
                 st.signals = {}
             st.signals.setdefault("reserve_gap_raw", gap_raw)
+    if outlier_report is not None:
+        outlier_report.extend(dropped)
+    _warn_price_outliers(dropped, n_total, outlier_max_ratio, "rescale_tick_reserves")
     return ticks
 
 
@@ -265,6 +348,9 @@ def load_parquet_ticks(
     reserves: str = "raw",
     bar_label: str = "start",
     reregistrations=None,
+    outlier_max_ratio: Union[float, None, str] = "default",
+    outlier_report: Optional[list] = None,
+    outlier_exempt_netuids: Iterable[int] = OUTLIER_EXEMPT_NETUIDS,
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
@@ -335,6 +421,29 @@ def load_parquet_ticks(
     SDK events (e.g. SN82, window starting on its event day: +14.5% vs SDK
     -6.0%, fixed to -5.4%). An event-day blackout (drop the netuid's ticks that
     day) was tried and did not help (D1 error 29.6 points), so it is not offered.
+
+    ``outlier_max_ratio`` (default ``"default"``: ``DEFAULT_OUTLIER_MAX_RATIO``
+    = 3.0 with ``reserves="rescale"``, off with ``reserves="raw"`` so the
+    default path stays the historical one): a subnet-hour whose close is more
+    than this factor away, in either direction, from the price implied by the
+    paired daily snapshot is DROPPED (the subnet is absent from that tick),
+    and a ``UserWarning`` reports the count. On by default when rescaling
+    because rescaling is what turns such a close into a pool the engine fills
+    and marks at: measured 2026-10-09, netuid 97 at 2026-03-13 09:00 UTC
+    closed at 40.09 TAO per alpha (the new subnet's bootstrap pool, after the
+    old subnet deregistered at 09:19) against a snapshot-implied 0.00266, and
+    one AutoBot CV fold under rescaled reserves returned +64,298%. Under raw
+    reserves the engine fills and marks at the snapshot, so such a close
+    misleads a strategy's decision but not its fills or marks. Dropping is used
+    rather than raw reserves (the old pool no longer exists) or clipping (it
+    invents a price). Causal: uses only the close and a snapshot at or before
+    the tick. With exact ``reregistrations`` and ``bar_label="start"``, the
+    hour whose bar contains the event is stamped as the OLD subnet but closes
+    at the new pool's price; this guard is what removes it on the rescale
+    path. ``None`` keeps every hour; a number > 1 sets the factor (also on
+    raw); ``outlier_report`` (a list) receives ``(timestamp, netuid, close,
+    implied_price, "ratio")`` per dropped hour; netuids in
+    ``outlier_exempt_netuids`` (default root, netuid 0) are never dropped.
     """
     from bt_trading_tools.backtest.types import SubnetTick, TickData
 
@@ -342,6 +451,11 @@ def load_parquet_ticks(
         raise ValueError(f"reserves must be 'rescale' or 'raw', got {reserves!r}")
     if bar_label not in ("start", "end"):
         raise ValueError(f"bar_label must be 'start' or 'end', got {bar_label!r}")
+    if isinstance(outlier_max_ratio, str):
+        if outlier_max_ratio != "default":
+            raise ValueError(f"outlier_max_ratio must be a number > 1, None or 'default', got {outlier_max_ratio!r}")
+        outlier_max_ratio = DEFAULT_OUTLIER_MAX_RATIO if reserves == "rescale" else None
+    _check_max_ratio(outlier_max_ratio)
     global _PARQUET_WARNED
     if not _PARQUET_WARNED:
         _PARQUET_WARNED = True
@@ -397,6 +511,17 @@ def load_parquet_ticks(
     )
     merged = merged.dropna(subset=["total_tao", "alpha_in_pool"])
     merged = merged[(merged["close"] > 0) & (merged["total_tao"] > 0) & (merged["alpha_in_pool"] > 0)]
+    if outlier_max_ratio is not None and len(merged):
+        n_total = len(merged)
+        implied = merged["total_tao"] / merged["alpha_in_pool"]
+        bad = ((merged["close"] / implied).map(math.log).abs() > math.log(outlier_max_ratio)) \
+            & ~merged["netuid"].isin(list(outlier_exempt_netuids))
+        dropped = [(int(r.unix_ts), int(r.netuid), float(r.close), float(r.total_tao / r.alpha_in_pool), "ratio")
+                   for r in merged[bad].itertuples(index=False)]
+        merged = merged[~bad]
+        if outlier_report is not None:
+            outlier_report.extend(dropped)
+        _warn_price_outliers(dropped, n_total, outlier_max_ratio, "load_parquet_ticks")
 
     ticks = []
     for ts, group in merged.groupby("unix_ts", sort=True):
@@ -435,6 +560,8 @@ __all__ = [
     "DEFAULT_SDK_POOL_STATE_CSV",
     "to_unix_seconds",
     "coerce_to_utc_timestamp",
+    "DEFAULT_OUTLIER_MAX_RATIO",
+    "OUTLIER_EXEMPT_NETUIDS",
     "rescale_reserves_to_price",
     "rescale_tick_reserves",
     "reserve_price_gap",
