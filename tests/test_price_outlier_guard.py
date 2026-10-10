@@ -195,11 +195,13 @@ def test_engine_no_longer_marks_at_the_bad_close(tmp_path):
 
 # ---------- rebirth day: exact events (main's reregistrations=) instead of a pre-rebirth drop ----------
 #
-# The branch fix/trap-fixes-2026-10-08 had a drop_pre_rebirth_reserves guard for
-# the midnight-floored daily detector. These tests show that exact events cover
-# the failure it targeted (a position opened earlier on the rebirth day marked at
-# the new subnet), and that the one remaining hole on the rescale path (the bar
-# containing the event, under bar_label="start") is closed by the ratio guard.
+# The branch fix/trap-fixes-2026-10-08 had a default-on drop_pre_rebirth_reserves
+# guard for the midnight-floored daily detector. These tests show that exact
+# events cover the failure it targeted (a position opened earlier on the rebirth
+# day marked at the new subnet), that the one remaining hole on the rescale path
+# (the bar containing the event, under bar_label="start") is closed by the ratio
+# guard, and that without exact events the gap remains unless the (now opt-in)
+# drop_pre_rebirth_reserves is passed.
 
 
 def _run(ticks):
@@ -256,6 +258,45 @@ def test_daily_detector_without_exact_events_still_misses_the_close(tmp_path):
     assert set(gens.values()) == {1}
     _, trades = _run(ticks)
     assert not [t for t in trades if t.get("reason") == "dereg_refund"]
+
+
+def test_opt_in_pre_rebirth_drop_closes_the_daily_detector_gap(tmp_path):
+    """drop_pre_rebirth_reserves=True with the daily detector: the event day's hours paired with the
+    dead subnet's snapshot are dropped (all 24 here, including 00:00..08:00 whose closes agree with
+    that snapshot, so the ratio test alone keeps them). One day of lookahead, as the stamping."""
+    o, p = _fixture(tmp_path, extra_hours=24)
+    report = []
+    with pytest.warns(UserWarning, match=r"dropped 24 of 96 subnet-hours \(1 subnets\) whose reserve snapshot"):
+        ticks = _load(o, p, reserves="raw", drop_pre_rebirth_reserves=True, outlier_report=report)
+    assert [r[4] for r in report] == ["pre_rebirth_reserves"] * 24
+    cells = _cells(ticks, 97)
+    day14 = int(pd.Timestamp("2026-03-14 00:00", tz="UTC").timestamp())
+    assert sorted(cells) == [day14 + 3600 * k for k in range(24)]
+    assert {st.generation for st in cells.values()} == {1}
+    assert len(_cells(ticks, 0)) == 48                               # root untouched
+
+
+def test_pre_rebirth_drop_with_exact_events_cuts_at_the_event_time(tmp_path):
+    """With exact events the cut is the event time, not midnight: the old subnet's hours before 09:19
+    stay (generation 0), the new subnet's hours that day on the dead snapshot go."""
+    o, p = _fixture(tmp_path, with_root=False, extra_hours=24)
+    report = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ticks = _load(o, p, reserves="raw", reregistrations={97: [EVENT]},
+                      drop_pre_rebirth_reserves=True, outlier_report=report)
+    hours = sorted(_cells(ticks, 97))
+    day13 = int(pd.Timestamp("2026-03-13 00:00", tz="UTC").timestamp())
+    assert [h for h in hours if h < day13 + 86400] == [day13 + 3600 * k for k in range(10)]   # 00:00..09:00
+    assert len(report) == 14 and {r[4] for r in report} == {"pre_rebirth_reserves"}            # 10:00..23:00
+
+
+def test_pre_rebirth_drop_is_off_by_default(tmp_path):
+    o, p = _fixture(tmp_path, with_root=False, extra_hours=24)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        ticks = _load(o, p, reserves="raw")
+    assert len(_cells(ticks, 97)) == 48
 
 
 # ---------- custom builders ----------

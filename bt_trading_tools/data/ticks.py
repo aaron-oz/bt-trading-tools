@@ -315,10 +315,12 @@ def reserve_price_gap(ticks: Iterable) -> dict:
     The engine fills from the reserves, so a large gap means mispriced fills.
     Accepts a list of ``TickData``. Returns ``{"n", "median_abs_gap",
     "p90_abs_gap", "share_over_2pct", "share_over_5pct", "max_abs_gap"}`` over every
-    (tick, subnet) with positive price and reserves. On the SDK feed the
-    median is about 0.005% and under 1% of subnet-ticks exceed 5%
-    (measured 2026-10); a median above about 1% or a share over 5% above
-    about 10% suggests stale reserves.
+    (tick, subnet) with positive price and reserves. Measured 2026-10-08:
+    on the SDK feed the median is about 0.05% for 2026-02 to 2026-06 and
+    about 0.00001% from 2026-07; hourly prices with raw daily reserves gave
+    a median of 0.5% to 1% and 7% to 15% of subnet-ticks over 5% on two
+    14-day windows. A median above about 0.5% or a share over 5% above a few
+    percent suggests stale reserves (see docs/known_traps.md).
     """
     gaps = []
     for t in ticks:
@@ -351,6 +353,7 @@ def load_parquet_ticks(
     outlier_max_ratio: Union[float, None, str] = "default",
     outlier_report: Optional[list] = None,
     outlier_exempt_netuids: Iterable[int] = OUTLIER_EXEMPT_NETUIDS,
+    drop_pre_rebirth_reserves: bool = False,
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
@@ -444,6 +447,24 @@ def load_parquet_ticks(
     raw); ``outlier_report`` (a list) receives ``(timestamp, netuid, close,
     implied_price, "ratio")`` per dropped hour; netuids in
     ``outlier_exempt_netuids`` (default root, netuid 0) are never dropped.
+
+    ``drop_pre_rebirth_reserves`` (default ``False``, any ``reserves`` mode):
+    drop a subnet-hour at or after a re-registration of its netuid whose
+    paired snapshot predates that event, i.e. reserves that describe the dead
+    subnet. Events are the ones used for stamping: ``reregistrations`` when
+    given (exact times), else the daily detector's, floored to midnight UTC.
+    With the daily detector this drops the event day's hours up to the
+    end-of-day snapshot, which are the old subnet's hours that the floored
+    stamping labels as the NEW subnet (a position bought then is never closed
+    and is later marked at the new subnet). That is up to one day of
+    lookahead and close to the event-day blackout described above, which did
+    not help on a HODL window, so it is opt-in. Measured 2026-10-10 on one
+    AutoBot V2-moderate CV fold (2026-02-11 to 2026-03-14, rescale, ratio
+    guard on, one seed): daily detector +19.62% with a 41% drawdown from the
+    netuid 76 rebirth day; with this option +5.01% (3.1%); with exact SDK
+    events instead +4.88% (3.2%). Prefer exact events where SDK snapshots
+    reach. Dropped hours go to ``outlier_report`` with reason
+    ``"pre_rebirth_reserves"``.
     """
     from bt_trading_tools.backtest.types import SubnetTick, TickData
 
@@ -511,8 +532,40 @@ def load_parquet_ticks(
     )
     merged = merged.dropna(subset=["total_tao", "alpha_in_pool"])
     merged = merged[(merged["close"] > 0) & (merged["total_tao"] > 0) & (merged["alpha_in_pool"] > 0)]
+    n_total = len(merged)
+    stamp_events = None
+    if stamp_identity or drop_pre_rebirth_reserves:
+        from bt_trading_tools.utils.lifecycle import reregistrations_from_pool_history
+        if reregistrations is not None:
+            stamp_events, floored = reregistrations, False
+        elif not stamp_identity and "alpha_staked" not in pool_unfiltered.columns:
+            stamp_events, floored = {}, True   # cannot detect events (synthetic pool files)
+        else:
+            stamp_events, floored = reregistrations_from_pool_history(pool_unfiltered), True
+    if drop_pre_rebirth_reserves and len(merged):
+        stale = pd.Series(False, index=merged.index)
+        for nid, events in stamp_events.items():
+            sel = merged["netuid"] == nid
+            if not sel.any():
+                continue
+            for ev in events:
+                ev = pd.Timestamp(ev)
+                ev = ev.tz_localize("UTC") if ev.tzinfo is None else ev
+                cut = (ev.normalize() if floored else ev).timestamp()
+                stale |= sel & (merged["pool_ts"] < ev.timestamp()) & (merged["unix_ts"] >= cut)
+        dropped = [(int(r.unix_ts), int(r.netuid), float(r.close), float(r.total_tao / r.alpha_in_pool),
+                    "pre_rebirth_reserves") for r in merged[stale].itertuples(index=False)]
+        merged = merged[~stale]
+        if outlier_report is not None:
+            outlier_report.extend(dropped)
+        if dropped:
+            warnings.warn(
+                f"load_parquet_ticks: dropped {len(dropped)} of {n_total} subnet-hours "
+                f"({len({d[1] for d in dropped})} subnets) whose reserve snapshot predates a re-registration "
+                "of that netuid (the reserves describe the dead subnet). See docs/known_traps.md.",
+                UserWarning, stacklevel=2,
+            )
     if outlier_max_ratio is not None and len(merged):
-        n_total = len(merged)
         implied = merged["total_tao"] / merged["alpha_in_pool"]
         bad = ((merged["close"] / implied).map(math.log).abs() > math.log(outlier_max_ratio)) \
             & ~merged["netuid"].isin(list(outlier_exempt_netuids))
@@ -541,16 +594,11 @@ def load_parquet_ticks(
             )
         ticks.append(TickData(timestamp=int(ts), subnets=subnets))
     if stamp_identity:
-        from bt_trading_tools.utils.lifecycle import (
-            reregistrations_from_pool_history, stamp_generations)
-        if reregistrations is not None:
-            stamp_generations(ticks, reregistrations)
-        else:
-            # Pool data is daily: floor events to midnight (see docstring for
-            # the failure this leaves; pass SDK events via `reregistrations`).
-            stamp_generations(
-                ticks, reregistrations_from_pool_history(pool_unfiltered),
-                floor_to_day=True)
+        from bt_trading_tools.utils.lifecycle import stamp_generations
+        # Exact events stamp at their time; daily-detector events are floored
+        # to midnight (see docstring for the failure this leaves; pass SDK
+        # events via `reregistrations`).
+        stamp_generations(ticks, stamp_events, floor_to_day=floored)
     return ticks
 
 
