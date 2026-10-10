@@ -17,20 +17,35 @@ calibrated against it. The parquet sources cover a longer history
 See `docs/realistic_backtesting_guide.md` for the source-choice
 guidance.
 
-KNOWN TRAP (reserves vs price): BacktestEngine fills from the pool RESERVES
-(``tao_pool``, ``alpha_pool``), not from ``SubnetTick.price``. The parquet
-source pairs an HOURLY close with a DAILY reserve snapshot; carried forward,
-the reserves lag the price by up to a day. Around surges the pool-implied
-price averaged 0.92 x the tick price at entry (measured 2026-10 on 160 surge
-episodes), i.e. entries priced about 8% below the tick price, which lifted the
-mean 24-hour return on those same episodes from +7.8% (contemporaneous SDK
-reserves) to +11.2%. ``load_parquet_ticks``
-now rescales the reserves to the hourly close by default (``reserves="rescale"``);
-this removes the price mismatch but not any change in pool DEPTH during the day.
-Where depth matters (surges, large clips) use SDK ticks. SDK snapshots exist
-from 2026-02-11 locally and, on bot-vps, as a 5-minute file back to
-2025-08-18 (``/root/sdk_backfill/sdk_snapshots/sdk_5min.csv``, ends 2026-02-14).
-Check any tick source with ``reserve_price_gap``. See docs/known_traps.md.
+KNOWN TRAPS in the parquet source (measured 2026-10; docs/known_traps.md):
+
+1. Reserves vs price. BacktestEngine fills from the pool RESERVES
+   (``tao_pool``, ``alpha_pool``), not from ``SubnetTick.price``. The parquet
+   source pairs an HOURLY close with a DAILY reserve snapshot; carried forward,
+   the reserves lag the price by up to a day (median error vs the true pool
+   price: 0.0% right at the snapshot, 1.7% at 18 to 24 h old; p90 7.9%).
+   Around surges the pool-implied price averaged 0.92 x the tick price at entry
+   (160 surge episodes), lifting a 24-hour mean return from +7.8% (contemporaneous
+   SDK reserves) to +11.2%. ``reserves="rescale"`` makes the reserves match the
+   hourly close at constant k, but it is NOT a validated fix (see 2 and 3): it
+   leaves depth changes uncorrected and on active strategies moved results by
+   orders of magnitude (an autobot fade study: +275% to +25,962%).
+2. Bar label lookahead. The OHLCV ``time`` is the bar START, the ``close`` is the
+   pool price at the bar END (measured: the close matches the true pool price one
+   hour after the label, median error 0.11%, versus 0.27% at the label). The
+   default ``bar_label="start"`` therefore gives every tick a price from one hour
+   in the FUTURE. Harmless for buy-and-hold between midnight endpoints, a
+   lookahead for any strategy that reads the price at the tick. ``bar_label="end"``
+   stamps each tick with the bar end so the close is known at its timestamp.
+3. Re-registrations. The daily pool-history detector misses re-registrations that
+   the 15-minute SDK detector finds (D1 window: SN82; cheapest-10 holdout: SN69;
+   D2: SN90), so those positions are valued against the NEW subnet's pool and show
+   fabricated profit (+19.9 and +34.9 TAO on 100 TAO of capital in two cases).
+   Parquet results over windows with re-registrations are not reliable.
+Where fills or entries depend on the price path (surges, hourly signals, large
+clips) use SDK ticks: local from 2026-02-11 and, on bot-vps, a 5-minute file back
+to 2025-08-18 (``/root/sdk_backfill/sdk_snapshots/sdk_5min.csv``, ends 2026-02-14).
+Check any tick source with ``reserve_price_gap``.
 
 Hexagonal precision note: pandas 3.0 defaults to microsecond resolution
 on datetime64; `astype("int64")` returns microseconds, not nanoseconds.
@@ -156,6 +171,9 @@ def load_sdk_ticks(
 # ── Reserve / price consistency ───────────────────────────────────────
 
 
+_PARQUET_WARNED = False
+
+
 def rescale_reserves_to_price(tao_pool: float, alpha_pool: float, price: float) -> tuple[float, float]:
     """Rescale constant-product reserves to a target price, keeping k = tao x alpha.
 
@@ -202,7 +220,8 @@ def load_parquet_ticks(
     pool_tolerance_days: int = 2,
     drop_startup_mode: bool = True,
     stamp_identity: bool = True,
-    reserves: str = "rescale",
+    reserves: str = "raw",
+    bar_label: str = "start",
 ) -> list:
     """Build TickData list from delegation_ohlcv_hourly + pool_history parquet.
 
@@ -210,16 +229,29 @@ def load_parquet_ticks(
     2026-02-11). Hourly cadence vs SDK's 15-min; pool data is daily,
     forward-filled to each hourly tick via `pd.merge_asof`.
 
-    ``reserves`` (default ``"rescale"``): the engine fills from reserves, and
-    daily reserves lag the hourly close, so by default the daily snapshot
-    supplies only the invariant k = tao x alpha and the reserves are rescaled to
-    the hourly close (``rescale_reserves_to_price``). ``"raw"`` keeps the daily
-    reserves unchanged (the behavior before 2026-10) and warns: fills are then
-    mispriced whenever price moved since the snapshot, most severely around
-    surges. Rescaling does not capture changes in pool depth; prefer SDK ticks
-    where depth matters. Each tick's ``signals`` carries ``reserve_gap_raw``
-    (raw implied price / close - 1) and ``reserve_age_s`` (age of the daily
-    snapshot).
+    READ docs/known_traps.md before using this for anything that trades or
+    decides at the tick: three measured problems are documented in the module
+    docstring (stale daily reserves; the bar-label lookahead; missed
+    re-registrations). The defaults below keep the historical behavior so old
+    results stay reproducible, and warn once per process.
+
+    ``reserves`` (default ``"raw"``): the engine fills from reserves; ``"raw"``
+    keeps the daily reserves unchanged (stale by up to a day). ``"rescale"``
+    keeps only the invariant k = tao x alpha from the daily snapshot and rescales
+    the reserves to the tick price (``rescale_reserves_to_price``): it removes
+    the price/reserve mismatch but not depth changes, was not validated against
+    contemporaneous reserves for active strategies, and on an autobot fade study
+    moved results by orders of magnitude; treat it as an experiment, not a fix.
+
+    ``bar_label`` (default ``"start"``): the OHLCV ``time`` is the bar START and
+    its ``close`` is the pool price at the bar END. ``"start"`` stamps the tick
+    with the bar start, so each tick carries a price one hour in the future (a
+    lookahead for any strategy reading the price at the tick). ``"end"`` stamps it
+    with the bar end (``time`` + 1 hour) so the close is known at its timestamp;
+    the pool-history reserve snapshot is then matched at that later time too.
+
+    Each tick's ``signals`` carries ``reserve_gap_raw`` (raw implied price / close
+    - 1) and ``reserve_age_s`` (age of the daily snapshot).
 
     Subnets are emitted only in hours where they traded (no forward fill of
     quiet hours), so a strategy that needs a subnet present every hour must
@@ -253,12 +285,21 @@ def load_parquet_ticks(
 
     if reserves not in ("rescale", "raw"):
         raise ValueError(f"reserves must be 'rescale' or 'raw', got {reserves!r}")
-    if reserves == "raw":
+    if bar_label not in ("start", "end"):
+        raise ValueError(f"bar_label must be 'start' or 'end', got {bar_label!r}")
+    global _PARQUET_WARNED
+    if not _PARQUET_WARNED:
+        _PARQUET_WARNED = True
+        issues = []
+        if reserves == "raw":
+            issues.append("daily reserves carried forward under hourly prices (engine fills from the reserves)")
+        if bar_label == "start":
+            issues.append("each tick carries the price from one hour LATER than its timestamp (bar_label='start')")
+        issues.append("the daily pool-history detector misses some subnet re-registrations that SDK ticks catch")
         warnings.warn(
-            "load_parquet_ticks(reserves='raw') pairs hourly prices with daily reserves; the engine fills "
-            "from the reserves, so fills are mispriced whenever price moved since the snapshot (about 8% "
-            "cheap at surge entries in 2026-10 measurements). Use the default reserves='rescale' or SDK "
-            "ticks. See docs/known_traps.md.",
+            "load_parquet_ticks known issues (measured 2026-10): " + "; ".join(issues) + ". "
+            "Results from this source can be mispriced or look-ahead biased; prefer SDK ticks where they reach. "
+            "See docs/known_traps.md. (Shown once per process.)",
             RuntimeWarning, stacklevel=2,
         )
 
@@ -267,6 +308,8 @@ def load_parquet_ticks(
 
     ohlcv = pd.read_parquet(ohlcv_parquet)
     ohlcv["unix_ts"] = to_unix_seconds(ohlcv["time"])
+    if bar_label == "end":
+        ohlcv["unix_ts"] = ohlcv["unix_ts"] + 3600
     ohlcv = ohlcv[
         (ohlcv["unix_ts"] >= start_ts.timestamp())
         & (ohlcv["unix_ts"] <= end_ts.timestamp())

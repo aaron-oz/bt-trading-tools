@@ -31,12 +31,29 @@ On the SDK feed itself the pool-implied price matches the tick price (median abs
 **Who is affected.** Any strategy whose price changes faster than the reserve snapshot: hourly-signal studies, surge or breakout entries, and anything evaluated on `load_parquet_ticks`. At the time of writing that loader is used by roughly ten autobot research scripts, a bluechip-fade script, and `bt_strategy.research.baselines`. Their numbers were produced with daily reserves and have not been re-checked.
 
 **What changed.**
-- `load_parquet_ticks(..., reserves="rescale")` is now the default. The daily snapshot supplies only the invariant `k = tao x alpha`; reserves are rescaled to the hourly close (`tao' = sqrt(k x price)`, `alpha' = sqrt(k / price)`), the approach the xs-momentum-rotation study validated against true hourly reserves for 2026-03 to 2026-05. `reserves="raw"` restores the old behavior and warns. This changes the numbers of any caller relying on the old default; those numbers were mispriced.
-- Each tick's `signals` now carries `reserve_gap_raw` (raw implied price / close - 1) and `reserve_age_s` (age of the daily snapshot).
+- `load_parquet_ticks(..., reserves=...)` has two modes. `"raw"` (the default; the historical behavior) keeps the daily reserves. `"rescale"` keeps only the invariant `k = tao x alpha` and rescales the reserves to the tick price (`tao' = sqrt(k x price)`, `alpha' = sqrt(k / price)`). Correction (2026-10-07): an earlier version of this page and PR #1 made `"rescale"` the default; that was premature (see "Why rescale is not the default" below) and the default is back to `"raw"`.
+- Each tick's `signals` carries `reserve_gap_raw` (raw implied price / close - 1) and `reserve_age_s` (age of the daily snapshot).
 - `reserve_price_gap(ticks)` summarizes the mismatch for any tick source. `BacktestResults.orders_checked` and `.orders_on_inconsistent_reserves` count how many orders sat on reserves more than 5% off the tick price, and the engine warns when more than 10% of at least 10 orders do.
+- `load_parquet_ticks` warns once per process that the source has known issues (this page), whatever the options.
 
-**What rescaling does not fix.** Pool depth (`k`) can change during the day, for example when a surge draws in TAO. Rescaling matches the price, not the depth, so slippage on large clips can still be wrong around big flows. Where depth matters, use SDK ticks (contemporaneous reserves). SDK snapshots are local from 2026-02-11 and, on the bot VPS, a 5-minute file exists back to 2025-08-18 (`/root/sdk_backfill/sdk_snapshots/sdk_5min.csv`, ends 2026-02-14).
-The parquet loader also emits a subnet only in hours where it traded (no forward fill), so a strategy that needs a subnet present every hour must handle gaps.
+**Measured age effect (2026-10-07, 376,113 subnet-hours with at least one trade, 2026-03-01 to 2026-07-30, against SDK pool prices).** Absolute log error of the daily-reserve implied price versus the true pool price at the tick label, by age of the daily snapshot: median 0.0% and p90 0.5% within 30 minutes of the snapshot; median 0.3% and p90 2.3% at 0.5 to 6 hours; median 0.9% and p90 4.5% at 6 to 12 hours; median 1.7% and p90 7.9% at 18 to 24 hours. Windows that begin and end at midnight sit within seconds of a snapshot, which is why buy-and-hold between midnight endpoints is barely affected.
+
+**Why rescale is not the default.**
+- It matches the price at constant k; it does not recover depth changes (a surge can double pool TAO within a day), and on active strategies it moved results by orders of magnitude (an autobot fade study: one variant +275% under raw reserves and +25,962% rescaled; a bluechip-fade variant -33% raw and +25% rescaled). Neither number is credible; the point is that rescaling is not a safe drop-in.
+- Against SDK results on midnight-aligned HODL windows, with re-registered subnets removed, mean absolute error was 1.1 percentage points rescaled and 1.8 raw (11 window-rules): both close, rescale slightly closer. With re-registered subnets left in, both parquet modes were off by up to 40 points on the same universe because of problem 4.
+- Where fills or entries depend on the price path, use SDK ticks.
+
+## 3. The bar label carries a one-hour lookahead (measured 2026-10-07)
+
+The hourly OHLCV `time` is the bar START; the `close` is the pool price at the bar END. Against SDK pool prices (same 376,113 subnet-hours), the close matched the true pool price at the label with median absolute log error 0.27% (p90 2.0%) and one hour after the label with median 0.11% (p90 1.0%); in hours where the pool moved 5% or more the close matched the price one hour later with median error 0.7% and the price at the label with median 6.8%. `load_parquet_ticks` stamps ticks with the bar start, so every tick carries a price from one hour in the future. For buy-and-hold between midnight endpoints this shifts both ends together and does little. For any strategy that reads the price at the tick (hourly signals, spike fades) it is a lookahead. `load_parquet_ticks(..., bar_label="end")` stamps each tick with the bar end so the close is known at its timestamp; it is opt-in because it changes every existing result.
+
+## 4. The parquet path misses some subnet re-registrations (measured 2026-10-07)
+
+On the same universes and windows, the 15-minute SDK path closed positions on re-registration of netuids that the parquet path did not flag: SN82 in the 2026-04-22 to 2026-06-06 HODL window, SN69 in the cheapest-10 holdout (2026-04-16 to 2026-06-26), SN90 in the 2026-06-06 to 2026-07-21 window. A missed re-registration values the old position against the new subnet's pool and shows fabricated profit: +19.9 TAO (SN82) and +34.9 TAO (SN69) on 100 TAO of capital, against -0.1 and +0.2 TAO on SDK ticks. With `reserves="rescale"` fabricated gains also appeared where the guard did fire (SN116: +20.7 TAO rescaled vs -2.7 TAO on SDK). The 2K-5K HODL headline for the 2026-04-22 window was +14.5% (raw) and +34.3% (rescaled) against -6.0% on SDK ticks, almost entirely this effect. Parquet results over windows containing re-registrations are not reliable; use SDK ticks, or drop the affected netuids as a check. The detector is not fixed yet.
+
+## Sparse presence
+
+The parquet loader emits a subnet only in hours where it traded (no forward fill), so a strategy that needs a subnet present every hour must handle gaps, and the set of subnets present at the first tick depends on the label convention.
 
 ## Quick checks before trusting a number
 
