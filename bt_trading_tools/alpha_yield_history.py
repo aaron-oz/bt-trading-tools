@@ -28,6 +28,12 @@ Two accrual conventions, selectable on ``HistoricalYieldModel``:
     using each day's own rate; closer to a time-varying yield, but NOT what
     paper does.
 
+Since 2026-10-10 the engine and paper accrue per tick (``ledger.accrue_yield``),
+so the convention applies to each tick's interval, not to the whole hold:
+under ``"sale_rate"`` each interval is paid at the rate in force at its end,
+and past accrual is no longer revalued. ``BacktestEngine(yield_accrual=
+"anchor")`` restores whole-hold behavior.
+
 Rates above ``MAX_PLAUSIBLE_RATE_PER_DAY`` are treated as data errors (0.0),
 as in ``AlphaYieldModel.rate``. A date or subnet with no history uses the most
 recent earlier rate for that subnet (no look-ahead); with none, 0.0.
@@ -149,11 +155,20 @@ class HistoricalYieldModel:
             return 0.0
         return r
 
-    def accrued_yield(self, netuid: int, alpha_qty: float, entry_time: float, now: float) -> float:
-        """Alpha accrued on ``alpha_qty`` held from ``entry_time`` to ``now`` (unix seconds)."""
+    def accrued_yield(self, netuid: int, alpha_qty: float, entry_time: float, now: float,
+                      generation_origin: Optional[float] = None) -> float:
+        """Alpha accrued on ``alpha_qty`` held from ``entry_time`` to ``now`` (unix seconds).
+
+        ``generation_origin`` (optional, default ``entry_time``): where to
+        start looking for a re-registration. The ledger's interval accrual
+        passes the position's yield anchor, so an interval that starts after
+        a rebirth still earns nothing.
+        """
         if alpha_qty <= 0 or not math.isfinite(alpha_qty) or now <= entry_time:
             return 0.0
-        end = generation_end(self._reregs, netuid, float(entry_time), float(now))
+        origin = float(entry_time) if generation_origin is None else min(
+            float(generation_origin), float(entry_time))
+        end = generation_end(self._reregs, netuid, origin, float(now))
         # Last instant whose daily rate certainly belongs to the entry's
         # generation: the end itself, or the day before the rebirth day.
         last_safe = end if end >= now else (end // DAY_S) * DAY_S - 1.0

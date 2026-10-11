@@ -22,6 +22,24 @@ Conventions (decided 2026-10-01, see
 * **Yield is folded into the position** whenever its size changes (top-up or
   sell), and the yield clock restarts from that moment, so alpha added later
   never accrues yield it did not earn. Yield alpha carries zero cost basis.
+* **Yield accrues along the rate path** (2026-10-10). The caller calls
+  :func:`accrue_yield` on every open position once per tick; each call
+  credits ``yield_fn`` over the interval since the previous call, so each
+  interval is paid at the rate in effect for that interval and earlier
+  accrual is never revalued. Before this, yield was
+  ``alpha x rate(now) x (now - anchor)``: the CURRENT rate applied to the
+  whole time since the anchor, so a falling rate marked down yield already
+  earned (measured on yield-carry 2026-09-23..10-08: -0.22 TAO on a 0.31 TAO
+  window figure, ``docs/yc_onchain_yield_2026_10_10.md`` in alpha-trading).
+  A caller that never calls :func:`accrue_yield` gets exactly the old
+  formula, which is how ``BacktestEngine(yield_accrual="anchor")`` and
+  ``PaperBotBase.yield_accrual = "anchor"`` reproduce it for regression
+  comparisons. Between calls, and from the last call to a sale or a mark,
+  the uncredited tail is paid at the rate ``yield_fn`` returns for that tail.
+  A position that has never been accrued (``yield_accrued_to is None``, for
+  example one loaded from a state file written before this change) starts
+  from the old formula's value at its first accrual, so a restart onto this
+  code does not move any position's yield.
 * **A deregistered subnet pays a refund**, approximated as spot price times
   alpha at the last snapshot before the re-registration. That reproduced the
   project's measured SN103 payout within -2.9% (2026-09-22). Refunds measured
@@ -37,9 +55,18 @@ from bt_trading_tools.amm import amm_sell
 from bt_trading_tools.backtest.types import Position
 
 # (netuid, alpha_qty, since_ts, now_ts) -> accrued alpha. Pure.
+# A yield function MAY also accept a keyword ``origin``: the start of the
+# position's current yield clock (its anchor). Interval accrual calls the
+# function on short intervals, so a model that stops accrual at a netuid
+# re-registration must search for the re-registration from ``origin``, not
+# from the interval start, or an interval after the rebirth would earn the new
+# subnet's rate. BacktestEngine._yield_fn and PaperBotBase._yield_fn forward it
+# to the model as ``generation_origin`` when the model accepts it.
 YieldFn = Callable[[int, float, float, float], float]
 
 DUST_ALPHA = 1e-9
+
+_ORIGIN_SUPPORT: dict = {}
 
 
 class GenerationMismatch(ValueError):
@@ -51,11 +78,76 @@ def yield_anchor(pos: Position) -> float:
     return pos.entry_time if pos.yield_anchor_time is None else pos.yield_anchor_time
 
 
+def accepts_kwarg(fn, name: str) -> bool:
+    """True when callable ``fn`` takes keyword ``name`` (or ``**kwargs``).
+    Cached per underlying function, so bound methods are cheap to test."""
+    key = (getattr(fn, "__func__", fn), name)
+    hit = _ORIGIN_SUPPORT.get(key)
+    if hit is None:
+        import inspect
+        try:
+            params = inspect.signature(fn).parameters
+            hit = name in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            hit = False
+        _ORIGIN_SUPPORT[key] = hit
+    return hit
+
+
+def _interval_yield(pos: Position, start: float, end: float,
+                    yield_fn: YieldFn) -> float:
+    """``yield_fn`` over ``[start, end]`` on the position's current alpha."""
+    if end <= start:
+        return 0.0
+    if accepts_kwarg(yield_fn, "origin"):
+        v = yield_fn(pos.netuid, pos.alpha_qty, start, end, origin=yield_anchor(pos))
+    else:
+        v = yield_fn(pos.netuid, pos.alpha_qty, start, end)
+    return max(0.0, float(v))
+
+
 def accrued_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
-    """Alpha accrued since the position's yield anchor. Does not mutate."""
+    """Alpha accrued since the position's yield anchor, not yet folded.
+
+    Equals ``yield_accrued`` (credited interval by interval by
+    :func:`accrue_yield`) plus the uncredited tail from ``yield_accrued_to``
+    to ``now``. For a position never accrued this is the pre-2026-10-10
+    formula, ``yield_fn`` from the anchor to ``now``. When ``now`` is before
+    ``yield_accrued_to`` (a deregistration close at the dead subnet's last
+    snapshot, after ticks that already accrued past it), the overrun is
+    removed at the rate ``yield_fn`` gives for it, floored at 0. With
+    ``yield_fn`` None there is no yield at all. Does not mutate.
+    """
     if yield_fn is None or pos.alpha_qty <= 0:
         return 0.0
-    return max(0.0, float(yield_fn(pos.netuid, pos.alpha_qty, yield_anchor(pos), now)))
+    if pos.yield_accrued_to is None:
+        return _interval_yield(pos, yield_anchor(pos), now, yield_fn)
+    base = max(0.0, float(pos.yield_accrued))
+    if now >= pos.yield_accrued_to:
+        return base + _interval_yield(pos, pos.yield_accrued_to, now, yield_fn)
+    overrun = _interval_yield(pos, max(now, yield_anchor(pos)),
+                              pos.yield_accrued_to, yield_fn)
+    return max(0.0, base - overrun)
+
+
+def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
+    """Credit yield from ``yield_accrued_to`` (or the anchor) to ``now``.
+
+    Call once per tick on every open position, before anything reads the
+    position's value. Returns the alpha credited by this call. A call with
+    ``now`` at or before ``yield_accrued_to`` changes nothing. With
+    ``yield_fn`` None nothing is credited and the clock is not moved.
+    """
+    if yield_fn is None:
+        return 0.0
+    if pos.yield_accrued_to is not None and now <= pos.yield_accrued_to:
+        return 0.0
+    before = 0.0 if pos.yield_accrued_to is None else max(0.0, float(pos.yield_accrued))
+    total = accrued_yield(pos, now, yield_fn)
+    pos.yield_accrued = total
+    pos.yield_accrued_to = now
+    return total - before
 
 
 def fold_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
@@ -71,6 +163,8 @@ def fold_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
         if pos.alpha_qty > 0:
             pos.entry_price = pos.tao_cost / pos.alpha_qty
     pos.yield_anchor_time = int(now)
+    pos.yield_accrued = 0.0
+    pos.yield_accrued_to = int(now)
     return accrued
 
 
@@ -103,6 +197,8 @@ def book_buy(
             metadata=dict(metadata or {}),
             generation=generation,
             yield_anchor_time=int(now),
+            yield_accrued=0.0,
+            yield_accrued_to=int(now),
         )
         positions[netuid] = pos
         return pos

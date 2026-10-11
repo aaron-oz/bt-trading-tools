@@ -289,8 +289,13 @@ class AlphaYieldModel:
         alpha_qty: float,
         entry_time: float,
         now: float,
+        generation_origin: float | None = None,
     ) -> float:
         """Return alpha accrued on a position since ``entry_time``.
+
+        ``generation_origin`` is accepted for interface compatibility with the
+        re-registration-aware models and ignored: this model has no
+        re-registration list (paper closes reborn positions itself).
 
         PURE FUNCTION — no state mutation, idempotent. Same
         ``(netuid, alpha_qty, entry_time, now)`` always returns the same
@@ -1203,11 +1208,16 @@ class HistoricalSubnetYieldModel:
             return 0.0
         return float(series.iloc[idx])
 
-    def accrued_yield(self, netuid: int, alpha_qty: float, entry_time, now) -> float:
+    def accrued_yield(self, netuid: int, alpha_qty: float, entry_time, now,
+                      generation_origin=None) -> float:
         series = self._lookup.get(int(netuid))
         if series is None or alpha_qty <= 0:
             return 0.0
-        end = generation_end(self._reregs, netuid, float(entry_time), float(now))
+        # ``generation_origin``: where to search for a re-registration (the
+        # ledger's interval accrual passes the position's yield anchor).
+        origin = float(entry_time) if generation_origin is None else min(
+            float(generation_origin), float(entry_time))
+        end = generation_end(self._reregs, netuid, origin, float(now))
         if end < float(now):
             # Clipped at a rebirth: the daily row dated on the rebirth day may
             # describe either subnet, so stop before that day's row.
