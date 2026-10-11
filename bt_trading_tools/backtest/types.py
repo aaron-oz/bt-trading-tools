@@ -52,6 +52,15 @@ class Position:
     # until a top-up or partial sell folds accrued yield into alpha_qty
     # (see bt_trading_tools.ledger). None means "use entry_time".
     yield_anchor_time: int | None = None
+    # Path-dependent yield accrual (2026-10-10, see bt_trading_tools.ledger).
+    # ``yield_accrued`` is alpha already credited but not yet folded into
+    # alpha_qty, accumulated interval by interval at each interval's own
+    # rate; ``yield_accrued_to`` is the time it covers up to. None means
+    # "never accrued" (a position created before this field existed, or one
+    # whose caller never calls ``ledger.accrue_yield``): accrual then runs
+    # from the yield anchor, which is the pre-2026-10-10 formula.
+    yield_accrued: float = 0.0
+    yield_accrued_to: float | None = None
 
 
 @dataclass

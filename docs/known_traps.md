@@ -139,6 +139,37 @@ Fold 1's remaining 41% drawdown under the rescale default comes from netuid 76's
 
 **What to do.** For anything built on `load_parquet_ticks` or a custom builder: pass exact `reregistrations=` where SDK snapshots reach; on the rescale path keep the ratio guard on and read the drop counts in the warnings; outside SDK coverage, consider `drop_pre_rebirth_reserves=True` and report results with and without it. Results that held a subnet across a re-registration day should not be relied on until rerun.
 
+## 8. Accrued yield was revalued at the current rate (fixed 2026-10-10)
+
+What it was. The engine and the paper bots credited staking yield as
+`alpha x rate(now) x (now - yield anchor)`: the rate at the sale or mark
+applied to the whole time since the position's yield anchor (its entry, or
+its last top-up or partial sell). When the rate fell, yield already earned was
+marked down; when it rose, it was marked up. Measured on yield-carry's
+2026-09-23 to 2026-10-08 window (alpha-trading
+`docs/yc_onchain_yield_2026_10_10.md`): the window's credited yield moved
+-0.22 TAO on a 0.31 TAO figure, because the positions' anchors were mostly in
+July 2026 and rates fell during the window.
+
+Fix. `ledger.accrue_yield` credits each position once per tick over the
+interval since the previous tick, at the rate the yield model gives for that
+interval; `Position.yield_accrued` / `yield_accrued_to` carry the running
+total. `BacktestEngine(yield_accrual="path")` is the default;
+`yield_accrual="anchor"` reproduces the old formula. Paper bots get the same
+through `bt_strategy.bot.PaperBotBase.yield_accrual` (same names, same
+default), so paper and backtest change together.
+
+Granularity. Per tick. With the sale-rate convention each interval is paid at
+the rate in force at the interval's end; with `HistoricalYieldModel(...,
+convention="integrated")` intervals are split at day boundaries. An engine
+run on hourly ticks and a paper bot on 5-minute ticks therefore differ only
+in which side of a rate change a straddling interval is paid at.
+
+Exposure check. Any result computed before this change with a time-varying
+rate source (`HistoricalYieldModel`, `HistoricalSubnetYieldModel`, a live
+provider whose rate changed during the hold) and long holds. With a constant
+rate the two formulas agree exactly.
+
 ## Sparse presence
 
 The parquet loader emits a subnet only in hours where it traded (no forward fill), so a strategy that needs a subnet present every hour must handle gaps, and the set of subnets present at the first tick depends on the label convention.

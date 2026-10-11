@@ -135,6 +135,7 @@ class BacktestEngine:
         realism_config: RealismConfig | None = None,
         realism_rng_seed: Optional[int] = 0,
         pool_safety_checker: Any = None,
+        yield_accrual: str = "path",
     ):
         """
         Extra kwargs (back-compat preserved when both are None):
@@ -186,6 +187,17 @@ class BacktestEngine:
                 with paper. Construct via:
                 ``PoolSafetyChecker(DataFramePoolHistoryProvider(pool_history_df))``.
 
+            yield_accrual: ``"path"`` (default since 2026-10-10): every open
+                position's yield is credited once per tick over the interval
+                since the previous tick (``ledger.accrue_yield``), so each
+                interval is paid at its own rate and past accrual is never
+                revalued. ``"anchor"``: the pre-2026-10-10 formula, the rate
+                at the sale or mark applied to the whole time since the
+                position's yield anchor. Kept for regression comparisons; it
+                must match the paper bots' ``PaperBotBase.yield_accrual`` for
+                an alignment comparison. With a constant rate both give the
+                same result.
+
         Compared to pre-integration: realism layers + proxy fee are now
         on by default. Existing tests that assert specific deterministic
         outcomes may need ``realism_config=RealismConfig(enabled=False)``
@@ -231,6 +243,10 @@ class BacktestEngine:
             rng_seed=realism_rng_seed,
         )
         self.pool_safety_checker = pool_safety_checker
+        if yield_accrual not in ("path", "anchor"):
+            raise ValueError(
+                f"yield_accrual must be 'path' or 'anchor', got {yield_accrual!r}")
+        self.yield_accrual = yield_accrual
         self._orders_checked = 0
         self._orders_gap = 0
 
@@ -306,6 +322,15 @@ class BacktestEngine:
 
             for _netuid, _st in tick.subnets.items():
                 self._last_seen[(_netuid, _st.generation)] = (_st, tick.timestamp)
+            # ── Credit yield for the interval since the previous tick, at
+            # this interval's rate (path-dependent accrual). Every open
+            # position, present in this tick or not: stake earns regardless.
+            if self.yield_accrual == "path":
+                for _pos in positions.values():
+                    ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn)
+            else:
+                for _pos in positions.values():
+                    ledger.clear_accrual(_pos)
             # ── Refresh pool-safety checker once per tick (clears its
             # per-subnet cache so subsequent check() calls see fresh data) ─
             if self.pool_safety_checker is not None:
@@ -848,13 +873,21 @@ class BacktestEngine:
         }
 
     def _yield_fn(self, netuid: int, alpha_qty: float,
-                  since: float, now: float) -> float:
-        """Ledger-compatible yield function over the engine's yield model."""
+                  since: float, now: float, origin: float | None = None) -> float:
+        """Ledger-compatible yield function over the engine's yield model.
+
+        ``origin`` (the position's yield anchor) is forwarded as
+        ``generation_origin`` to models that accept it, so a model's
+        re-registration cutoff still applies when the ledger accrues over
+        short intervals.
+        """
         if self.yield_model is None:
             return 0.0
-        return self.yield_model.accrued_yield(
-            netuid=netuid, alpha_qty=alpha_qty, entry_time=since, now=now,
-        )
+        acc = self.yield_model.accrued_yield
+        if origin is not None and ledger.accepts_kwarg(acc, "generation_origin"):
+            return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since,
+                       now=now, generation_origin=origin)
+        return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since, now=now)
 
     def _portfolio_value(
         self,
