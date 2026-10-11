@@ -60,25 +60,33 @@ HISTORY_COLUMNS = ["date", "netuid", "hotkey", "stake_rao", "thirty_day_apy",
                    "thirty_day_epoch_participation", "timestamp"]
 
 
-def load_validator_yield_history(paths: Union[str, Path, Iterable[Union[str, Path]]]) -> pd.DataFrame:
-    """Read one or more history CSVs (same schema) into one frame."""
+def load_validator_yield_history(paths: Union[str, Path, Iterable[Union[str, Path]]],
+                                 extra_columns: Iterable[str] = ()) -> pd.DataFrame:
+    """Read one or more history CSVs (same schema) into one frame.
+
+    ``extra_columns`` adds columns beyond :data:`HISTORY_COLUMNS` (for example
+    ``seven_day_apy``, to build a rate table from it with ``rate_column``).
+    """
     if isinstance(paths, (str, Path)):
         paths = [paths]
-    frames = [pd.read_csv(p, usecols=HISTORY_COLUMNS) for p in paths]
+    cols = HISTORY_COLUMNS + [c for c in extra_columns if c not in HISTORY_COLUMNS]
+    frames = [pd.read_csv(p, usecols=cols) for p in paths]
     return pd.concat(frames, ignore_index=True)
 
 
-def build_rate_table(
+def select_validators(
     history: pd.DataFrame,
     min_uptime: float = 0.95,
     min_stake_share: float = 0.02,
     top_k: int = 20,
 ) -> pd.DataFrame:
-    """Per (netuid, date) rate per day, by the validator-selection cache's rules.
+    """The validators :func:`build_rate_table` averages over, per (netuid, date).
 
-    The LAST snapshot of each (netuid, date) is used (history files can hold
-    several snapshots per day). Returns columns ``netuid``, ``date`` (midnight
-    UTC, ``datetime64``), ``rate_per_day``.
+    The LAST snapshot of each (netuid, date) is used. A validator passes with
+    ``thirty_day_epoch_participation >= min_uptime`` and a stake share of the
+    subnet's recorded stake of at least ``min_stake_share``; the ``top_k`` by
+    ``thirty_day_apy`` are kept. Returns the history rows of the selected
+    validators (all input columns), ``date`` unchanged.
     """
     h = history.dropna(subset=["thirty_day_apy", "stake_rao"]).copy()
     h = h[h["stake_rao"] > 0]
@@ -88,8 +96,29 @@ def build_rate_table(
     h["share"] = h["stake_rao"] / total
     h = h[(h["thirty_day_epoch_participation"] >= min_uptime) & (h["share"] >= min_stake_share)]
     h = h.sort_values(["netuid", "date", "thirty_day_apy"], ascending=[True, True, False])
-    h = h.groupby(["netuid", "date"]).head(top_k)
-    h["w"] = h["stake_rao"] * h["thirty_day_apy"]
+    return h.groupby(["netuid", "date"]).head(top_k)
+
+
+def build_rate_table(
+    history: pd.DataFrame,
+    min_uptime: float = 0.95,
+    min_stake_share: float = 0.02,
+    top_k: int = 20,
+    rate_column: str = "thirty_day_apy",
+) -> pd.DataFrame:
+    """Per (netuid, date) rate per day, by the validator-selection cache's rules.
+
+    Validators are chosen by :func:`select_validators` (ranked by
+    ``thirty_day_apy`` whatever ``rate_column`` is); the rate is the
+    stake-weighted mean of ``rate_column`` (an annual APY, default
+    ``thirty_day_apy``; ``seven_day_apy`` gives the 7-day variant) divided by
+    365. Validators with a missing ``rate_column`` value are left out of the
+    mean. Returns columns ``netuid``, ``date`` (midnight UTC,
+    ``datetime64``), ``rate_per_day``.
+    """
+    h = select_validators(history, min_uptime, min_stake_share, top_k)
+    h = h.dropna(subset=[rate_column])
+    h = h.assign(w=h["stake_rao"] * h[rate_column])
     g = h.groupby(["netuid", "date"]).agg(w=("w", "sum"), s=("stake_rao", "sum")).reset_index()
     g["rate_per_day"] = (g["w"] / g["s"]) / 365.0
     g["date"] = pd.to_datetime(g["date"], utc=True)
