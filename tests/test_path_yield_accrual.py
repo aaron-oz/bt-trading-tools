@@ -181,6 +181,19 @@ class TestEngineModes(unittest.TestCase):
         eq_a = [p["total_equity"] for p in a.equity_curve]
         self.assertLess(eq_a[10], eq_a[9])                    # the old revaluation
 
+    def test_anchor_mode_ignores_a_stored_path_total(self):
+        """An initial position already accrued in path mode (a paper book
+        after the switch) is read with the old formula in anchor mode."""
+        m = StepRateModel([(0, 0.01), (5 * DAY, 0.002)])
+        p = Position(netuid=7, entry_price=0.001, alpha_qty=1000.0, tao_cost=1.0,
+                     entry_time=0, generation=0, yield_anchor_time=0,
+                     yield_accrued=999.0, yield_accrued_to=4 * DAY)
+        ticks = [tick(t) for t in (5 * DAY, 6 * DAY)]
+        hold = type("Hold", (), {"on_tick": lambda self, *a: []})()
+        r = engine(m, "anchor").run(ticks, hold, initial_positions={7: p})
+        sell = r.trades[-1]
+        self.assertAlmostEqual(sell["alpha_yield_accrued"], 1000 * 0.002 * 6, places=9)
+
     def test_bad_mode_rejected(self):
         with self.assertRaises(ValueError):
             engine(StepRateModel([]), "sale")

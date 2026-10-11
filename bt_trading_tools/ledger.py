@@ -150,6 +150,16 @@ def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> floa
     return total - before
 
 
+def clear_accrual(pos: Position) -> None:
+    """Forget the path accumulator, so :func:`accrued_yield` falls back to the
+    pre-2026-10-10 formula (``yield_fn`` from the anchor to now). Used by the
+    ``"anchor"`` accrual mode each tick, so that mode reproduces the old
+    numbers exactly even on positions that were accrued in path mode before
+    (for example a paper state file after a rollback)."""
+    pos.yield_accrued = 0.0
+    pos.yield_accrued_to = None
+
+
 def fold_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
     """Add accrued yield to ``alpha_qty`` and restart the yield clock.
 

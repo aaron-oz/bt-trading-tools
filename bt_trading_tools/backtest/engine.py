@@ -328,6 +328,9 @@ class BacktestEngine:
             if self.yield_accrual == "path":
                 for _pos in positions.values():
                     ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn)
+            else:
+                for _pos in positions.values():
+                    ledger.clear_accrual(_pos)
             # ── Refresh pool-safety checker once per tick (clears its
             # per-subnet cache so subsequent check() calls see fresh data) ─
             if self.pool_safety_checker is not None:
