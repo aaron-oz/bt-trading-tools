@@ -444,4 +444,13 @@ def onchain_model_from_env(rule: ValidatorRule = ValidatorRule(), **kw) -> Optio
     if os.environ.get("ONCHAIN_YIELD_OBSERVE_LAG_S"):
         kw.setdefault("observe_lag_s", float(os.environ["ONCHAIN_YIELD_OBSERVE_LAG_S"]))
     kw.setdefault("keep_days", 60)
-    return RealizedYieldModel(path, rule=rule, **kw)
+    # One model per (table, rule, settings) per process: momentum-lab runs
+    # many paper accounts in one process, and they must share the same data.
+    key = (str(Path(path).resolve()), rule, tuple(sorted(kw.items())))
+    m = _ENV_MODELS.get(key)
+    if m is None:
+        m = _ENV_MODELS[key] = RealizedYieldModel(path, rule=rule, **kw)
+    return m
+
+
+_ENV_MODELS: dict = {}
