@@ -170,6 +170,16 @@ rate source (`HistoricalYieldModel`, `HistoricalSubnetYieldModel`, a live
 provider whose rate changed during the hold) and long holds. With a constant
 rate the two formulas agree exactly.
 
+## 9. Yield credited at a modeled pooled rate, not the validator's realized rate (addressed 2026-10-12, opt-in)
+
+What: every yield model before `bt_trading_tools.realized_yield` credited a subnet-level modeled rate (a trailing APY, pooled over several validators). A real stake earns the realized share-price growth of the ONE validator it is staked with, and a decision can only know that growth after the day ends.
+
+Fix (opt-in, pass the model explicitly): `RealizedYieldModel(daily_table, rule=ValidatorRule(...))`. It credits each position its validator's realized daily rate (`Position.validator_hotkey`, assigned at the buy by the order's `validator_hotkey` or by the rule), falling back to the pooled on-chain rate. Rates of days not yet observable (`obs_day`, default 2 hours after the UTC day ends) are provisional at the last known rate, and the engine commits accrual only through `final_through(now)`, so the provisional tail is trued up once the realized rate is known (`ledger.accrue_yield(commit_to=...)`). Decisions read only `obs_day` and earlier (`choose_validator`, `trailing_rate`).
+
+Caution: the daily on-chain rate for date d is what was paid DURING d. Never use `realized_rate(d)` or a rate table built from it as a signal for a decision taken during d; use `trailing_rate(as_of=...)`.
+
+Remaining deviation: a fold (top-up, partial or full sell) fixes the provisional tail at that moment; it is not trued up afterwards. Paper does the same, so alignment holds, but both differ from a real stake by up to one day of the difference between the provisional and the realized rate on the folded alpha.
+
 ## Sparse presence
 
 The parquet loader emits a subnet only in hours where it traded (no forward fill), so a strategy that needs a subnet present every hour must handle gaps, and the set of subnets present at the first tick depends on the label convention.

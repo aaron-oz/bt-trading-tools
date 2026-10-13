@@ -326,8 +326,11 @@ class BacktestEngine:
             # this interval's rate (path-dependent accrual). Every open
             # position, present in this tick or not: stake earns regardless.
             if self.yield_accrual == "path":
+                _commit = self._yield_commit_to(tick.timestamp)
                 for _pos in positions.values():
-                    ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn)
+                    self._assign_validator(_pos, tick.timestamp)
+                    ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn,
+                                        commit_to=_commit)
             else:
                 for _pos in positions.values():
                     ledger.clear_accrual(_pos)
@@ -687,11 +690,13 @@ class BacktestEngine:
             return None
         eff_price = spend / alpha_received
 
-        ledger.book_buy(
+        _pos = ledger.book_buy(
             positions, order.netuid, alpha_received, spend, fee, tick.timestamp,
             generation=st.generation, yield_fn=self._yield_fn,
             metadata=order.signal_data,
         )
+        self._assign_validator(_pos, tick.timestamp,
+                               (order.signal_data or {}).get("validator_hotkey"))
 
         trade = {
             "netuid": order.netuid,
@@ -873,7 +878,8 @@ class BacktestEngine:
         }
 
     def _yield_fn(self, netuid: int, alpha_qty: float,
-                  since: float, now: float, origin: float | None = None) -> float:
+                  since: float, now: float, origin: float | None = None,
+                  hotkey: str | None = None, as_of: float | None = None) -> float:
         """Ledger-compatible yield function over the engine's yield model.
 
         ``origin`` (the position's yield anchor) is forwarded as
@@ -883,11 +889,22 @@ class BacktestEngine:
         """
         if self.yield_model is None:
             return 0.0
-        acc = self.yield_model.accrued_yield
-        if origin is not None and ledger.accepts_kwarg(acc, "generation_origin"):
-            return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since,
-                       now=now, generation_origin=origin)
-        return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since, now=now)
+        return ledger.call_yield_model(self.yield_model, netuid, alpha_qty, since, now,
+                                origin=origin, hotkey=hotkey, as_of=as_of)
+
+    def _yield_commit_to(self, now: float):
+        """``final_through(now)`` of a model with provisional recent rates
+        (``realized_yield.RealizedYieldModel``), else None (commit to now)."""
+        ft = getattr(self.yield_model, "final_through", None)
+        return None if ft is None else ft(now)
+
+    def _assign_validator(self, pos: Position, now: float, hotkey=None) -> None:
+        """Stake ``pos`` through a validator: the order's ``validator_hotkey``
+        if given, else the yield model's selection rule (``choose_hotkey``),
+        when the model has one. Same rule as ``PaperBotBase``."""
+        chooser = getattr(self.yield_model, "choose_hotkey", None)
+        if hotkey or chooser is not None:
+            ledger.assign_validator(pos, now, chooser, hotkey)
 
     def _portfolio_value(
         self,

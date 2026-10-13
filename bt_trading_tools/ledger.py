@@ -74,6 +74,24 @@ class GenerationMismatch(ValueError):
     generation. The caller must close the old position first."""
 
 
+def call_yield_model(model, netuid: int, alpha_qty: float, since: float, now: float,
+                     origin: Optional[float] = None, hotkey: Optional[str] = None,
+                     as_of: Optional[float] = None) -> float:
+    """Call ``model.accrued_yield`` with the optional keywords it accepts
+    (``generation_origin``, ``hotkey``, ``as_of``). Shared by
+    ``BacktestEngine._yield_fn`` and ``PaperBotBase._yield_fn`` so both pass
+    exactly the same arguments."""
+    acc = model.accrued_yield
+    kw = {}
+    if origin is not None and accepts_kwarg(acc, "generation_origin"):
+        kw["generation_origin"] = origin
+    if hotkey and accepts_kwarg(acc, "hotkey"):
+        kw["hotkey"] = hotkey
+    if as_of is not None and accepts_kwarg(acc, "as_of"):
+        kw["as_of"] = as_of
+    return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since, now=now, **kw)
+
+
 def yield_anchor(pos: Position) -> float:
     return pos.entry_time if pos.yield_anchor_time is None else pos.yield_anchor_time
 
@@ -96,14 +114,26 @@ def accepts_kwarg(fn, name: str) -> bool:
 
 
 def _interval_yield(pos: Position, start: float, end: float,
-                    yield_fn: YieldFn) -> float:
-    """``yield_fn`` over ``[start, end]`` on the position's current alpha."""
+                    yield_fn: YieldFn, as_of: Optional[float] = None) -> float:
+    """``yield_fn`` over ``[start, end]`` on the position's current alpha.
+
+    Optional keywords, passed only to a ``yield_fn`` that accepts them:
+    ``origin`` (the yield anchor), ``hotkey`` (the position's validator, when
+    set) and ``as_of`` (the time whose knowledge the rates must respect; a
+    model with observation lags, ``bt_trading_tools.realized_yield``, uses it
+    to tell realized days from provisional ones).
+    """
     if end <= start:
         return 0.0
+    kw = {}
     if accepts_kwarg(yield_fn, "origin"):
-        v = yield_fn(pos.netuid, pos.alpha_qty, start, end, origin=yield_anchor(pos))
-    else:
-        v = yield_fn(pos.netuid, pos.alpha_qty, start, end)
+        kw["origin"] = yield_anchor(pos)
+    hk = getattr(pos, "validator_hotkey", None)
+    if hk and accepts_kwarg(yield_fn, "hotkey"):
+        kw["hotkey"] = hk
+    if as_of is not None and accepts_kwarg(yield_fn, "as_of"):
+        kw["as_of"] = as_of
+    v = yield_fn(pos.netuid, pos.alpha_qty, start, end, **kw)
     return max(0.0, float(v))
 
 
@@ -122,25 +152,44 @@ def accrued_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> flo
     if yield_fn is None or pos.alpha_qty <= 0:
         return 0.0
     if pos.yield_accrued_to is None:
-        return _interval_yield(pos, yield_anchor(pos), now, yield_fn)
+        return _interval_yield(pos, yield_anchor(pos), now, yield_fn, as_of=now)
     base = max(0.0, float(pos.yield_accrued))
     if now >= pos.yield_accrued_to:
-        return base + _interval_yield(pos, pos.yield_accrued_to, now, yield_fn)
+        return base + _interval_yield(pos, pos.yield_accrued_to, now, yield_fn, as_of=now)
     overrun = _interval_yield(pos, max(now, yield_anchor(pos)),
-                              pos.yield_accrued_to, yield_fn)
+                              pos.yield_accrued_to, yield_fn, as_of=now)
     return max(0.0, base - overrun)
 
 
-def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
+def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn],
+                 commit_to: Optional[float] = None) -> float:
     """Credit yield from ``yield_accrued_to`` (or the anchor) to ``now``.
 
     Call once per tick on every open position, before anything reads the
-    position's value. Returns the alpha credited by this call. A call with
-    ``now`` at or before ``yield_accrued_to`` changes nothing. With
+    position's value. Returns the alpha credited (committed) by this call. A
+    call with ``now`` at or before ``yield_accrued_to`` changes nothing. With
     ``yield_fn`` None nothing is credited and the clock is not moved.
+
+    ``commit_to`` (2026-10-12, provisional credit with true-up): when given
+    and before ``now``, only yield up to ``commit_to`` is stored as final; the
+    stretch from there to ``now`` stays uncredited and :func:`accrued_yield`
+    recomputes it at every read with the rates known then. A model whose
+    recent rates are provisional (``realized_yield.RealizedYieldModel``)
+    passes its ``final_through(now)`` here, so a provisional credit is
+    trued up once the realized rate is observable, and committed days are
+    never revalued. The committed stretch is computed with ``as_of=now``.
     """
     if yield_fn is None:
         return 0.0
+    if commit_to is not None and commit_to < now:
+        start = yield_anchor(pos) if pos.yield_accrued_to is None else pos.yield_accrued_to
+        if commit_to <= start:
+            return 0.0
+        base = 0.0 if pos.yield_accrued_to is None else max(0.0, float(pos.yield_accrued))
+        add = _interval_yield(pos, start, commit_to, yield_fn, as_of=now)
+        pos.yield_accrued = base + add
+        pos.yield_accrued_to = commit_to
+        return add
     if pos.yield_accrued_to is not None and now <= pos.yield_accrued_to:
         return 0.0
     before = 0.0 if pos.yield_accrued_to is None else max(0.0, float(pos.yield_accrued))
@@ -148,6 +197,22 @@ def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> floa
     pos.yield_accrued = total
     pos.yield_accrued_to = now
     return total - before
+
+
+def assign_validator(pos: Position, now: float, chooser, hotkey: Optional[str] = None) -> Optional[str]:
+    """Give ``pos`` a validator hotkey if it has none (2026-10-12).
+
+    ``hotkey`` (for example the one a bot put on its order) wins; otherwise
+    ``chooser(netuid, now)`` (``RealizedYieldModel.choose_hotkey``) decides.
+    An existing hotkey is never changed: a top-up stays with the position's
+    validator. Returns the position's hotkey after the call.
+    """
+    if getattr(pos, "validator_hotkey", None):
+        return pos.validator_hotkey
+    hk = hotkey or (chooser(pos.netuid, now) if chooser is not None else None)
+    if hk:
+        pos.validator_hotkey = str(hk)
+    return pos.validator_hotkey
 
 
 def clear_accrual(pos: Position) -> None:

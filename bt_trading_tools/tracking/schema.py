@@ -71,6 +71,8 @@ class AlphaYieldSource(str, Enum):
     EMPIRICAL = "empirical"
     VALIDATOR_CACHE = "validator_cache"
     FALLBACK = "fallback"
+    # Realized share-price growth read from chain (bt_trading_tools.realized_yield).
+    ONCHAIN_REALIZED = "onchain_realized"
 
 
 class ExecutionMode(str, Enum):
