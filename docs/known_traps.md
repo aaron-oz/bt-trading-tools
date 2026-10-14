@@ -81,7 +81,7 @@ Fix: `load_parquet_ticks(..., reregistrations=...)` takes exact events, and `uti
 
 **What to do.** Read `model.rejected_rate_rows` after building a CSV or history model. Pass `reregistrations` when the ticks are not stamped.
 
-## 6. `yield_model=None` picks a rate source from the environment
+## 6. `yield_model=None` picks a rate source from the environment (superseded 2026-10-14: the default is now the realized on-chain model; the cascade below is only the fallback)
 
 **What happens.** `BacktestEngine(yield_model=None)` builds `build_default_yield_model()`, a cascade whose tiers are switched on by the environment: the validator-selection cache (`VALIDATOR_CACHE_PATH`, or the first existing file of `/root/.validator_selection/best_validators.json`, `~/.validator_selection/best_validators.json`, `/tmp/autobot_live_data/best_validators.json`), live taostats (`TAOSTATS_API_KEY`), live chain (`BT_NETWORK`), the empirical CSV estimate (`TAOSTATS_DATA_DIR`), then zero. The same script therefore credits different yield in different shells and on different machines. Every non-zero tier is a rate as of now (the cache file's last refresh, today's taostats or chain state, or a trailing window at the end of the CSV), so on a historical window the yield is not point-in-time, which is a form of lookahead. The tiers also disagree in size: on the emission-drought bot's 2026-06-30 to 2026-09-23 window, paper's logged rate (taostats or cache tier) was 2.4 to 9.5 times the backtest's empirical-tier rate on the same subnets (median 4.2; source: `bt_trading_tools/alpha_yield_history.py` module docstring and `alpha-trading/docs/edb_core_alignment_2026_10_05.md`).
 
@@ -90,6 +90,8 @@ Fix: `load_parquet_ticks(..., reregistrations=...)` takes exact events, and `uti
 **What changed.** The selection itself is unchanged (making the point-in-time `HistoricalYieldModel` the default is a pending decision). `BacktestEngine` now emits one `UserWarning` per distinct configuration per process naming the primary tier (`validator_cache`, `taostats_live`, `chain_live`, `empirical`, or `zero`), the configured tiers, and, for non-zero tiers, the lookahead note; the description is stored in `engine.default_yield_cascade` (None when a model is passed). `bt_trading_tools.alpha_yield.describe_default_yield_cascade()` returns the same description without building anything. The primary tier is what the configuration says will be tried first; a subnet the tier cannot answer falls through to the next one (`CascadingYieldProvider.instrumentation_snapshot()` reports what was actually used).
 
 **What to do.** Pass `yield_model` explicitly in every backtest whose number will be relied on, and record which one. For point-in-time rates use `bt_trading_tools.alpha_yield_history.HistoricalYieldModel(build_rate_table(load_validator_yield_history(...)))`.
+
+**Since 2026-10-14** the cascade is reached only when no realized on-chain table is found (section 9), and the engine then warns with a message starting `BacktestEngine FALLBACK: yield_model=None and no realized on-chain yield table was found`. `engine.default_yield_source` records which source the default resolved to.
 
 ## 7. Rescaled reserves turn a close from a different pool into a fillable pool (measured 2026-10-09, revised 2026-10-10)
 
@@ -170,11 +172,17 @@ rate source (`HistoricalYieldModel`, `HistoricalSubnetYieldModel`, a live
 provider whose rate changed during the hold) and long holds. With a constant
 rate the two formulas agree exactly.
 
-## 9. Yield credited at a modeled pooled rate, not the validator's realized rate (addressed 2026-10-12, opt-in)
+## 9. Yield credited at a modeled pooled rate, not the validator's realized rate (addressed 2026-10-12; the default since 2026-10-14)
 
 What: every yield model before `bt_trading_tools.realized_yield` credited a subnet-level modeled rate (a trailing APY, pooled over several validators). A real stake earns the realized share-price growth of the ONE validator it is staked with, and a decision can only know that growth after the day ends.
 
-Fix (opt-in, pass the model explicitly): `RealizedYieldModel(daily_table, rule=ValidatorRule(...))`. It credits each position its validator's realized daily rate (`Position.validator_hotkey`, assigned at the buy by the order's `validator_hotkey` or by the rule), falling back to the pooled on-chain rate. Rates of days not yet observable (`obs_day`, default 2 hours after the UTC day ends) are provisional at the last known rate, and the engine commits accrual only through `final_through(now)`, so the provisional tail is trued up once the realized rate is known (`ledger.accrue_yield(commit_to=...)`). Decisions read only `obs_day` and earlier (`choose_validator`, `trailing_rate`).
+Fix: `RealizedYieldModel(daily_table, rule=ValidatorRule(...))`. It credits each position its validator's realized daily rate (`Position.validator_hotkey`, assigned at the buy by the order's `validator_hotkey` or by the rule), falling back to the pooled on-chain rate. Rates of days not yet observable (`obs_day`, default 2 hours after the UTC day ends) are provisional at the last known rate, and the engine commits accrual only through `final_through(now)`, so the provisional tail is trued up once the realized rate is known (`ledger.accrue_yield(commit_to=...)`). Decisions read only `obs_day` and earlier (`choose_validator`, `trailing_rate`).
+
+**Default since 2026-10-14 (owner ruling).** `BacktestEngine(yield_model=None)` builds `RealizedYieldModel` over the daily table found by `realized_yield.default_table_path()`: `BT_ONCHAIN_YIELD_TABLE` (else `ONCHAIN_YIELD_TABLE`) if set (`off` disables), otherwise the first existing of `/root/onchain_yield/onchain_yield_daily.parquet` and `~/data/onchain_yield_daily/onchain_yield_daily.parquet`. One model per (file, modification time) per process, never reloaded during a run. Default rule `ValidatorRule()`, mode `validator`, no re-registration cutoffs (generation-stamped ticks close a position at a rebirth; pass your own model with `reregistrations=` to also stop accrual from the table side). If no table is found the engine falls back to the old cascade of section 6 with a loud warning. Consequence: an old harness that relied on `yield_model=None` now credits different yield than when it was run (it got the zero tier on a plain shell on the development machine, section 6); rerun before comparing.
+
+**No take filter (owner ruling 2026-10-14).** `ValidatorRule().max_take` is `None`: realized yield is already after the validator's take, so a take cap only removes validators that may pay the most. A float still caps take as an opt-in. Until 2026-10-14 the default was 0.18 (the chain maximum, so inactive) and yield-carry used 0.12.
+
+**Fallbacks are announced.** Every credited day not paid from the position's own validator row is counted in `model.fallback_counts` and announced by one `UserWarning` per kind per process (text starts `RealizedYieldModel FALLBACK (<kind>)`): `pooled_for_validator` (the validator has no valid row that day; pooled rate), `pooled_no_validator` (no validator passed the rule at the buy; pooled rate), `no_coverage` (netuid or day not in the table; zero credited), `stale_table` (credited time more than 3 days past the table's newest date; an old provisional rate). Measured 2026-10-13 on yield-carry seed 0: 0.1% (2026-04-10 to 10-08) and 1.0% (2025-11-25 to 2026-04-10) of held position-days had no row for the position's validator. A test suite that must not depend on local data sets `BT_ONCHAIN_YIELD_TABLE=off` (bt-trading-tools' own `tests/conftest.py` does).
 
 Caution: the daily on-chain rate for date d is what was paid DURING d. Never use `realized_rate(d)` or a rate table built from it as a signal for a decision taken during d; use `trailing_rate(as_of=...)`.
 
@@ -192,7 +200,8 @@ print(reserve_price_gap(ticks))            # SDK ticks: median under ~0.001; raw
 # custom builder pairing an intra-day price with daily reserves (opt-in, section 2):
 # from bt_trading_tools.data import rescale_tick_reserves; rescale_tick_reserves(ticks)
 # rep = []; load_parquet_ticks(..., outlier_report=rep)  # rep lists hours dropped as price outliers or pre-rebirth reserves (section 7)
-print(engine.default_yield_cascade)        # None if you passed yield_model; else which env tier was used (section 6)
+print(engine.default_yield_source)         # None if you passed yield_model; else the realized table used (section 9) or the fallback cascade tier (section 6)
+print(getattr(engine.yield_model, "fallback_counts", None))  # realized model: days credited from a fallback (section 9)
 print(getattr(engine.yield_model, "rejected_rate_rows", None))  # CSV/history models: rows rejected as implausible (section 5)
 res = BacktestEngine(...).run(ticks, strategy)
 print(res.orders_checked, res.orders_on_inconsistent_reserves)

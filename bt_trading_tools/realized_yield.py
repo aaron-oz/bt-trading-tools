@@ -57,13 +57,34 @@ decisions.
 
 Validator selection rule (:class:`ValidatorRule`), evaluated at decision time
 T on ``obs_day(T)``: among the subnet's validators with a permit on that day,
-stake share >= ``min_stake_share``, delegate take <= ``max_take`` (unknown take
-passes unless ``unknown_take_passes`` is False), and at least
+stake share >= ``min_stake_share``, and at least
 ``min_valid_days`` valid daily rates in the trailing ``window_days`` days,
 pick the highest mean realized rate over that window; ties go to the
 lexicographically smaller hotkey, so the choice is deterministic. If no
 validator passes, the position gets no hotkey (pooled rate) and the choice is
 retried at later ticks.
+
+No take filter by default (owner ruling 2026-10-14). The realized rate is
+already after the validator's take, so a cap on take only removes validators
+whose net yield may be the highest. ``max_take`` stays available as an opt-in
+(a float caps take; ``None``, the default, filters nothing).
+
+Fallbacks are announced (owner ruling 2026-10-14). Whenever a credited day is
+paid from something other than the position's own validator row, the model
+counts it in ``fallback_counts`` and emits a one-time ``UserWarning`` per kind
+per process:
+
+* ``pooled_for_validator``: the position's validator has no valid row that day,
+  the pooled subnet rate is used;
+* ``pooled_no_validator``: the position has no validator (no validator passed
+  the rule at its buy), the pooled subnet rate is used;
+* ``no_coverage``: neither exists (the netuid or the day is not in the table),
+  0.0 is credited;
+* ``stale_table``: the time credited is more than 3 days past the table's
+  newest date, so the provisional rate is an old one.
+
+``mode="pooled"`` is a deliberate choice, not a fallback, and is not counted
+under ``pooled_*``.
 
 A re-registration of the netuid (``reregistrations``) stops accrual at the
 first rebirth after the position's yield origin, and no day on or after the
@@ -75,6 +96,7 @@ import bisect
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -92,6 +114,24 @@ from bt_trading_tools.tracking.schema import AlphaYieldSource
 
 DAY_S = 86400
 DEFAULT_OBSERVE_LAG_S = 7200.0
+# Days past the table's newest date after which provisional credit counts as
+# a ``stale_table`` fallback (the normal lag is 1 to 2 days).
+STALE_TABLE_DAYS = 3
+
+FALLBACK_KINDS = ("pooled_for_validator", "pooled_no_validator", "no_coverage", "stale_table")
+_FALLBACK_TEXT = {
+    "pooled_for_validator": "a position's validator has no valid realized row for a day; "
+                            "that day is credited at the POOLED subnet rate instead",
+    "pooled_no_validator": "a position has no validator (none passed the rule); it is "
+                           "credited at the POOLED subnet rate",
+    "no_coverage": "the realized table has no row for this netuid and day (validator or "
+                   "pooled); ZERO yield is credited for it",
+    "stale_table": "the time credited is more than %d days past the realized table's newest "
+                   "date; the provisional rate credited is an OLD realized rate"
+                   % STALE_TABLE_DAYS,
+}
+# (kind) already announced in this process.
+_FALLBACK_WARNED: set = set()
 
 _COLUMNS = ["date", "netuid", "hotkey", "rate_per_day", "valid", "permit",
             "stake_share", "total_hotkey_alpha"]
@@ -101,14 +141,15 @@ _COLUMNS = ["date", "netuid", "hotkey", "rate_per_day", "valid", "permit",
 class ValidatorRule:
     """Explicit validator selection rule (module docstring).
 
-    Defaults: 7-day trailing window, at least 5 valid days in it, take at most
-    0.18 (the chain's default and maximum delegate take, so the cap is
-    inactive by default), stake share at least 2% of the subnet's permit
-    holders' stake, permit required.
+    Defaults: 7-day trailing window, at least 5 valid days in it, no take
+    filter (``max_take=None``; realized yield is already after take, owner
+    ruling 2026-10-14), stake share at least 2% of the subnet's permit
+    holders' stake, permit required. ``max_take`` set to a float is an
+    opt-in cap.
     """
     window_days: int = 7
     min_valid_days: int = 5
-    max_take: float = 0.18
+    max_take: Optional[float] = None
     min_stake_share: float = 0.02
     require_permit: bool = True
     unknown_take_passes: bool = True
@@ -184,6 +225,7 @@ class RealizedYieldModel:
         self.keep_days = keep_days
         self.max_rate = max_rate_per_day
         self._reregs = normalize_reregistrations(reregistrations)
+        self.fallback_counts: dict = {k: 0 for k in FALLBACK_KINDS}
         self._path: Optional[Path] = None
         self._mtime = 0.0
         self._next_check = 0.0
@@ -308,27 +350,66 @@ class RealizedYieldModel:
             return rates[i]
         return None
 
-    def realized_rate(self, netuid: int, day: int, hotkey: Optional[str] = None) -> Optional[float]:
-        """Rate for one day by the crediting rule (validator, else pooled); None if neither."""
+    def _rate_src(self, netuid: int, day: int, hotkey: Optional[str]):
+        """(rate, source) for one day by the crediting rule, no bookkeeping.
+        source: "validator", "pooled" or None (rate None)."""
         if self.mode == "validator" and hotkey:
             r = self._lookup(self._hk.get((int(netuid), hotkey)), day)
             if r is not None:
-                return r
-        return self._lookup(self._pool.get(int(netuid)), day)
+                return r, "validator"
+        r = self._lookup(self._pool.get(int(netuid)), day)
+        return (r, "pooled") if r is not None else (None, None)
+
+    def _note(self, src: Optional[str], hotkey: Optional[str], netuid: int, day: int) -> None:
+        """Count (and announce once per process) a credited day not paid from
+        the position's own validator row."""
+        if src == "validator" or (src == "pooled" and self.mode == "pooled"):
+            return
+        if src is None:
+            kind = "no_coverage"
+        else:
+            kind = "pooled_for_validator" if hotkey else "pooled_no_validator"
+        self._fallback(kind, netuid, day)
+
+    def _fallback(self, kind: str, netuid: int, day: int) -> None:
+        self.fallback_counts[kind] = self.fallback_counts.get(kind, 0) + 1
+        if kind in _FALLBACK_WARNED:
+            return
+        _FALLBACK_WARNED.add(kind)
+        when = pd.Timestamp(int(day) * DAY_S, unit="s", tz="UTC").date()
+        cover = ("empty" if self.first_day is None else
+                 f"{pd.Timestamp(self.first_day * DAY_S, unit='s', tz='UTC').date()} to "
+                 f"{pd.Timestamp(self.last_day * DAY_S, unit='s', tz='UTC').date()}")
+        warnings.warn(
+            f"RealizedYieldModel FALLBACK ({kind}): {_FALLBACK_TEXT[kind]}. First case: "
+            f"netuid {int(netuid)}, {when}; table covers {cover}. Shown once per process; "
+            "model.fallback_counts has the totals. See bt-trading-tools docs/known_traps.md.",
+            UserWarning, stacklevel=3)
+
+    def realized_rate(self, netuid: int, day: int, hotkey: Optional[str] = None) -> Optional[float]:
+        """Rate for one day by the crediting rule (validator, else pooled); None if neither."""
+        return self._rate_src(netuid, day, hotkey)[0]
 
     def known_rate(self, netuid: int, day: int, hotkey: Optional[str], as_of: float) -> float:
         """Rate credited for ``day`` as known at ``as_of``: realized if observable,
-        else the last realized rate up to ``obs_day(as_of)`` (provisional)."""
+        else the last realized rate up to ``obs_day(as_of)`` (provisional).
+        Fallbacks are counted and announced (module docstring)."""
         od = self.obs_day(as_of)
         if od is None:
+            self._fallback("no_coverage", netuid, day)
             return 0.0
         if day <= od:
-            r = self.realized_rate(netuid, day, hotkey)
+            r, src = self._rate_src(netuid, day, hotkey)
+            self._note(src, hotkey, netuid, day)
             return 0.0 if r is None else r
+        if day - self.last_day > STALE_TABLE_DAYS:
+            self._fallback("stale_table", netuid, day)
         for back in range(0, 8):          # last known: walk back from obs_day
-            r = self.realized_rate(netuid, od - back, hotkey)
+            r, src = self._rate_src(netuid, od - back, hotkey)
             if r is not None:
+                self._note(src, hotkey, netuid, day)
                 return r
+        self._note(None, hotkey, netuid, day)
         return 0.0
 
     def accrued_yield(self, netuid: int, alpha_qty: float, entry_time: float, now: float,
@@ -398,8 +479,9 @@ class RealizedYieldModel:
         if r.require_permit:
             m &= g["permit"].fillna(False).astype(bool)
         m &= g["stake_share"].fillna(0.0) >= r.min_stake_share
-        take_ok = g["take"] <= r.max_take
-        m &= take_ok | (g["take"].isna() & r.unknown_take_passes)
+        if r.max_take is not None:
+            take_ok = g["take"] <= r.max_take
+            m &= take_ok | (g["take"].isna() & r.unknown_take_passes)
         e = g[m]
         return e.sort_values(["trail", "hotkey"], ascending=[False, True])
 
@@ -454,3 +536,65 @@ def onchain_model_from_env(rule: ValidatorRule = ValidatorRule(), **kw) -> Optio
 
 
 _ENV_MODELS: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Default yield source for BacktestEngine(yield_model=None) (owner ruling
+# 2026-10-14): the realized on-chain model over the local daily table.
+
+DEFAULT_TABLE_ENV = "BT_ONCHAIN_YIELD_TABLE"
+DEFAULT_TABLE_CANDIDATES = (
+    "/root/onchain_yield/onchain_yield_daily.parquet",          # bot-vps daily job
+    "~/data/onchain_yield_daily/onchain_yield_daily.parquet",   # local research copy
+)
+_DEFAULT_MODELS: dict = {}
+
+
+def default_table_path() -> tuple[Optional[Path], list[str]]:
+    """The daily table the engine default uses, and the places searched.
+
+    ``BT_ONCHAIN_YIELD_TABLE`` (else ``ONCHAIN_YIELD_TABLE``, the paper
+    drop-in's variable) names it explicitly; the values ``off`` / ``none`` /
+    empty string mean "no table" (the engine then falls back, loudly). Unset:
+    the first existing path of ``DEFAULT_TABLE_CANDIDATES``.
+    """
+    for var in (DEFAULT_TABLE_ENV, "ONCHAIN_YIELD_TABLE"):
+        if var in os.environ:
+            v = os.environ[var].strip()
+            if v.lower() in ("", "off", "none", "0"):
+                return None, [f"{var}={v!r} (disabled)"]
+            p = Path(v).expanduser()
+            return (p if p.exists() else None), [f"{var}={v}"]
+    searched = []
+    for c in DEFAULT_TABLE_CANDIDATES:
+        p = Path(c).expanduser()
+        searched.append(str(p))
+        if p.exists():
+            return p, searched
+    return None, searched
+
+
+def build_default_realized_model(**kw) -> tuple[Optional[RealizedYieldModel], dict]:
+    """``(model, info)`` for the engine default; model None when no table.
+
+    One model per (path, modification time, settings) per process, without
+    file reloading (a backtest must not change data mid-run). The default
+    rule is ``ValidatorRule()`` and ``mode="validator"``; no re-registration
+    cutoffs are attached (generation-stamped ticks make the engine close a
+    position at a netuid rebirth; pass a model with ``reregistrations`` to
+    also stop accrual from the table side).
+    """
+    path, searched = default_table_path()
+    info = {"path": None if path is None else str(path), "searched": searched}
+    if path is None:
+        return None, info
+    key = (str(path.resolve()), path.stat().st_mtime, tuple(sorted(kw.items())))
+    m = _DEFAULT_MODELS.get(key)
+    if m is None:
+        kw.setdefault("reload_check_s", None)
+        m = RealizedYieldModel(path, **kw)
+        _DEFAULT_MODELS.clear()
+        _DEFAULT_MODELS[key] = m
+    day = lambda d: None if d is None else str(pd.Timestamp(d * DAY_S, unit="s", tz="UTC").date())
+    info.update({"first_day": day(m.first_day), "last_day": day(m.last_day)})
+    return m, info
