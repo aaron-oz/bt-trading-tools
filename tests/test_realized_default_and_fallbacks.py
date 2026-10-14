@@ -129,9 +129,9 @@ def test_default_table_search_order(tmp_path, monkeypatch):
     monkeypatch.delenv("ONCHAIN_YIELD_TABLE", raising=False)
     a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
     b.write_bytes(b"x")
-    monkeypatch.setattr(ry, "DEFAULT_TABLE_CANDIDATES", (str(a), str(b)))
+    monkeypatch.setattr(ry, "DEFAULT_TABLE_CANDIDATES", ("/root/no/such.parquet", str(a), str(b)))
     path, searched = ry.default_table_path()
-    assert path == b and searched == [str(a), str(b)]
+    assert path == b and searched == ["/root/no/such.parquet", str(a), str(b)]
     monkeypatch.setenv("ONCHAIN_YIELD_TABLE", str(a))       # explicit wins, even if missing
     assert ry.default_table_path()[0] is None
     monkeypatch.setenv("BT_ONCHAIN_YIELD_TABLE", "off")

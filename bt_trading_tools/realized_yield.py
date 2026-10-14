@@ -558,18 +558,24 @@ def default_table_path() -> tuple[Optional[Path], list[str]]:
     empty string mean "no table" (the engine then falls back, loudly). Unset:
     the first existing path of ``DEFAULT_TABLE_CANDIDATES``.
     """
+    def _exists(p: Path) -> bool:
+        try:                          # /root is unreadable on a workstation
+            return p.is_file()
+        except OSError:
+            return False
+
     for var in (DEFAULT_TABLE_ENV, "ONCHAIN_YIELD_TABLE"):
         if var in os.environ:
             v = os.environ[var].strip()
             if v.lower() in ("", "off", "none", "0"):
                 return None, [f"{var}={v!r} (disabled)"]
             p = Path(v).expanduser()
-            return (p if p.exists() else None), [f"{var}={v}"]
+            return (p if _exists(p) else None), [f"{var}={v}"]
     searched = []
     for c in DEFAULT_TABLE_CANDIDATES:
         p = Path(c).expanduser()
         searched.append(str(p))
-        if p.exists():
+        if _exists(p):
             return p, searched
     return None, searched
 
