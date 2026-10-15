@@ -61,6 +61,10 @@ class Position:
     # from the yield anchor, which is the pre-2026-10-10 formula.
     yield_accrued: float = 0.0
     yield_accrued_to: float | None = None
+    # Validator hotkey the position stakes through (2026-10-12). Yield models
+    # with ``supports_hotkey`` (bt_trading_tools.realized_yield) credit that
+    # validator's realized rate; None means the subnet's pooled rate.
+    validator_hotkey: str | None = None
 
 
 @dataclass

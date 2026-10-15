@@ -145,8 +145,12 @@ class BacktestEngine:
                 per-trade FeeModel.quote(...) call. Trade records gain
                 ``swap_fee_tao`` / ``gas_fee_tao`` / ``proxy_fee_tao`` /
                 ``fee_source`` fields.
-            yield_model: When provided, applies alpha yield accretion to
-                sells (``effective_alpha_qty``) and to MTM equity. Pure,
+            yield_model: Applies alpha yield accretion to sells
+                (``effective_alpha_qty``) and to MTM equity. ``None``
+                (default) means the realized on-chain model over the local
+                daily table (``realized_yield.build_default_realized_model``,
+                since 2026-10-14); if no table is found the engine falls back
+                to the old env-driven cascade with a loud ``UserWarning``. Pure,
                 idempotent; backtest-time simulated timestamps are used
                 as ``now`` so reruns are deterministic. Trade records
                 (sells) gain ``alpha_yield_accrued``.
@@ -183,8 +187,10 @@ class BacktestEngine:
                 orders for subnets flagged by the slow_drain / fast_rug /
                 A>S filters — same behaviour as paper bots get via
                 PaperBotBase. Sells are never blocked. Defaults to None
-                (no filter); pass an instance to align backtest filtering
-                with paper. Construct via:
+                (no filter). The filter is OFF fleet-wide since 2026-10-14
+                (owner ruling); pass an instance only for an explicit
+                filter-on comparison, or to replay a paper record from
+                before 2026-10-14, when paper ran it on. Construct via:
                 ``PoolSafetyChecker(DataFramePoolHistoryProvider(pool_history_df))``.
 
             yield_accrual: ``"path"`` (default since 2026-10-10): every open
@@ -213,29 +219,39 @@ class BacktestEngine:
         self.portfolio_log = portfolio_log
         self.ticks_per_year = ticks_per_year
         self.fee_model = fee_model
-        # Yield is on by default. When the caller doesn't pass a yield_model,
-        # use the env-driven default cascade (TAOSTATS_API_KEY, BT_NETWORK,
-        # TAOSTATS_DATA_DIR). In test environments with no env vars set, the
-        # cascade fast-fails to zero — same effective behavior as the
-        # historical default, but safe-by-default in production usage.
+        # Yield is on by default. Since 2026-10-14 (owner ruling) the default
+        # for yield_model=None is the REALIZED on-chain model
+        # (bt_trading_tools.realized_yield.build_default_realized_model): each
+        # position earns its validator's realized daily rate, point in time.
+        # If no daily table is found, fall back to the old env-driven cascade
+        # and say so loudly, once per configuration per process.
+        self.default_yield_source = None
+        self.default_yield_cascade = None
         if yield_model is None:
-            from bt_trading_tools.alpha_yield import (
-                build_default_yield_model, default_yield_cascade_warning,
-                describe_default_yield_cascade)
-            self.yield_model = build_default_yield_model()
-            # Which tier wins depends on the shell (env vars, cache files),
-            # and every non-zero tier is a rate as of now. Say so once per
-            # distinct configuration per process (docs/known_traps.md).
-            desc = describe_default_yield_cascade()
-            key = (tuple(desc["tiers"]), desc["validator_cache_path"])
-            self.default_yield_cascade = desc
-            if key not in _CASCADE_WARNED:
-                _CASCADE_WARNED.add(key)
-                warnings.warn(default_yield_cascade_warning(desc),
-                              UserWarning, stacklevel=2)
+            from bt_trading_tools.realized_yield import build_default_realized_model
+            model, info = build_default_realized_model()
+            if model is not None:
+                self.yield_model = model
+                self.default_yield_source = {"source": "onchain_realized", **info}
+            else:
+                from bt_trading_tools.alpha_yield import (
+                    build_default_yield_model, default_yield_cascade_warning,
+                    describe_default_yield_cascade)
+                self.yield_model = build_default_yield_model()
+                desc = describe_default_yield_cascade()
+                key = (tuple(desc["tiers"]), desc["validator_cache_path"])
+                self.default_yield_cascade = desc
+                self.default_yield_source = {"source": "cascade", **info, **desc}
+                if key not in _CASCADE_WARNED:
+                    _CASCADE_WARNED.add(key)
+                    warnings.warn(
+                        "BacktestEngine FALLBACK: yield_model=None and no realized on-chain "
+                        f"yield table was found (searched {info['searched']}; set "
+                        "BT_ONCHAIN_YIELD_TABLE to the daily table). Falling back to the "
+                        "old default cascade. " + default_yield_cascade_warning(desc),
+                        UserWarning, stacklevel=2)
         else:
             self.yield_model = yield_model
-            self.default_yield_cascade = None
         self.uses_proxy = uses_proxy
         self.realism_rng_seed = realism_rng_seed
         self._realism = RealismSimulator(
@@ -326,8 +342,11 @@ class BacktestEngine:
             # this interval's rate (path-dependent accrual). Every open
             # position, present in this tick or not: stake earns regardless.
             if self.yield_accrual == "path":
+                _commit = self._yield_commit_to(tick.timestamp)
                 for _pos in positions.values():
-                    ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn)
+                    self._assign_validator(_pos, tick.timestamp)
+                    ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn,
+                                        commit_to=_commit)
             else:
                 for _pos in positions.values():
                     ledger.clear_accrual(_pos)
@@ -687,11 +706,13 @@ class BacktestEngine:
             return None
         eff_price = spend / alpha_received
 
-        ledger.book_buy(
+        _pos = ledger.book_buy(
             positions, order.netuid, alpha_received, spend, fee, tick.timestamp,
             generation=st.generation, yield_fn=self._yield_fn,
             metadata=order.signal_data,
         )
+        self._assign_validator(_pos, tick.timestamp,
+                               (order.signal_data or {}).get("validator_hotkey"))
 
         trade = {
             "netuid": order.netuid,
@@ -873,7 +894,8 @@ class BacktestEngine:
         }
 
     def _yield_fn(self, netuid: int, alpha_qty: float,
-                  since: float, now: float, origin: float | None = None) -> float:
+                  since: float, now: float, origin: float | None = None,
+                  hotkey: str | None = None, as_of: float | None = None) -> float:
         """Ledger-compatible yield function over the engine's yield model.
 
         ``origin`` (the position's yield anchor) is forwarded as
@@ -883,11 +905,22 @@ class BacktestEngine:
         """
         if self.yield_model is None:
             return 0.0
-        acc = self.yield_model.accrued_yield
-        if origin is not None and ledger.accepts_kwarg(acc, "generation_origin"):
-            return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since,
-                       now=now, generation_origin=origin)
-        return acc(netuid=netuid, alpha_qty=alpha_qty, entry_time=since, now=now)
+        return ledger.call_yield_model(self.yield_model, netuid, alpha_qty, since, now,
+                                origin=origin, hotkey=hotkey, as_of=as_of)
+
+    def _yield_commit_to(self, now: float):
+        """``final_through(now)`` of a model with provisional recent rates
+        (``realized_yield.RealizedYieldModel``), else None (commit to now)."""
+        ft = getattr(self.yield_model, "final_through", None)
+        return None if ft is None else ft(now)
+
+    def _assign_validator(self, pos: Position, now: float, hotkey=None) -> None:
+        """Stake ``pos`` through a validator: the order's ``validator_hotkey``
+        if given, else the yield model's selection rule (``choose_hotkey``),
+        when the model has one. Same rule as ``PaperBotBase``."""
+        chooser = getattr(self.yield_model, "choose_hotkey", None)
+        if hotkey or chooser is not None:
+            ledger.assign_validator(pos, now, chooser, hotkey)
 
     def _portfolio_value(
         self,
