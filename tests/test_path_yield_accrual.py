@@ -5,6 +5,11 @@ mark was applied to the whole hold and a falling rate marked down yield
 already earned. Now each tick credits the interval since the previous tick at
 that interval's rate (``ledger.accrue_yield``); ``yield_accrual="anchor"``
 reproduces the old formula.
+
+Since 2026-10-22 the default (``compound=True``, engine ``"path"``) compounds;
+these tests pin the simple path accrual (``compound=False``, engine
+``"path_simple"``) whose mechanics they check. Compounding is tested in
+``tests/test_compound_yield.py``.
 """
 
 import unittest
@@ -85,9 +90,9 @@ class TestLedgerAccrual(unittest.TestCase):
         m = StepRateModel([(0, 0.01)])
         p = self.pos()
         for t in range(3600, 10 * DAY + 1, 3600):
-            ledger.accrue_yield(p, t, m.accrued_yield)
+            ledger.accrue_yield(p, t, m.accrued_yield, compound=False)
         legacy = m.accrued_yield(7, 1000.0, 0, 10 * DAY)
-        self.assertAlmostEqual(ledger.accrued_yield(p, 10 * DAY, m.accrued_yield),
+        self.assertAlmostEqual(ledger.accrued_yield(p, 10 * DAY, m.accrued_yield, compound=False),
                                legacy, places=9)
         self.assertAlmostEqual(legacy, 100.0, places=9)
 
@@ -96,8 +101,8 @@ class TestLedgerAccrual(unittest.TestCase):
         p = self.pos()
         seen = []
         for t in range(DAY, 15 * DAY + 1, DAY):
-            ledger.accrue_yield(p, t, m.accrued_yield)
-            seen.append(ledger.accrued_yield(p, t, m.accrued_yield))
+            ledger.accrue_yield(p, t, m.accrued_yield, compound=False)
+            seen.append(ledger.accrued_yield(p, t, m.accrued_yield, compound=False))
         self.assertEqual(seen, sorted(seen))                     # never falls
         # Day 10's interval ends at 10*DAY, where the new rate is in force
         # (rate at the interval end, as the sale-rate convention reads it).
@@ -111,7 +116,7 @@ class TestLedgerAccrual(unittest.TestCase):
         m = StepRateModel([(0, 0.01), (5 * DAY, 0.002)])
         p = self.pos(yield_accrued_to=None)
         old_value = m.accrued_yield(7, 1000.0, 0, 8 * DAY)
-        credited = ledger.accrue_yield(p, 8 * DAY, m.accrued_yield)
+        credited = ledger.accrue_yield(p, 8 * DAY, m.accrued_yield, compound=False)
         self.assertAlmostEqual(credited, old_value, places=9)
         self.assertAlmostEqual(p.yield_accrued, old_value, places=9)
         self.assertEqual(p.yield_accrued_to, 8 * DAY)
@@ -119,8 +124,8 @@ class TestLedgerAccrual(unittest.TestCase):
     def test_fold_resets_accumulator(self):
         m = StepRateModel([(0, 0.01)])
         p = self.pos()
-        ledger.accrue_yield(p, 2 * DAY, m.accrued_yield)
-        folded = ledger.fold_yield(p, 3 * DAY, m.accrued_yield)
+        ledger.accrue_yield(p, 2 * DAY, m.accrued_yield, compound=False)
+        folded = ledger.fold_yield(p, 3 * DAY, m.accrued_yield, compound=False)
         self.assertAlmostEqual(folded, 30.0, places=9)
         self.assertAlmostEqual(p.alpha_qty, 1030.0, places=9)
         self.assertEqual((p.yield_accrued, p.yield_accrued_to, p.yield_anchor_time),
@@ -129,9 +134,9 @@ class TestLedgerAccrual(unittest.TestCase):
     def test_dereg_close_before_accrued_to_removes_overrun(self):
         m = StepRateModel([(0, 0.01)])
         positions = {7: self.pos()}
-        ledger.accrue_yield(positions[7], 10 * DAY, m.accrued_yield)
+        ledger.accrue_yield(positions[7], 10 * DAY, m.accrued_yield, compound=False)
         rec = ledger.close_deregistered(positions, 7, 100.0, 100_000.0, 8 * DAY,
-                                        yield_fn=m.accrued_yield)
+                                        yield_fn=m.accrued_yield, compound=False)
         self.assertAlmostEqual(rec["alpha_yield_accrued"], 80.0, places=9)
 
     def test_rebirth_cutoff_holds_for_short_intervals(self):
@@ -147,7 +152,7 @@ class TestLedgerAccrual(unittest.TestCase):
         def fn(n, q, a, b, origin=None):
             return m.accrued_yield(n, q, a, b, generation_origin=origin)
         for t in range(t0 + 3600, t0 + 15 * DAY + 1, 3600):
-            ledger.accrue_yield(p, t, fn)
+            ledger.accrue_yield(p, t, fn, compound=False)
         legacy = m.accrued_yield(7, 1000.0, t0, t0 + 15 * DAY)
         self.assertAlmostEqual(p.yield_accrued, legacy, places=6)
         self.assertLess(p.yield_accrued, 1000 * 0.01 * 10.1)
@@ -157,7 +162,7 @@ class TestEngineModes(unittest.TestCase):
     def test_constant_rate_engine_path_equals_anchor(self):
         m = StepRateModel([(0, 0.005)])
         a = _run(m, "anchor", sell_at=12)
-        b = _run(m, "path", sell_at=12)
+        b = _run(m, "path_simple", sell_at=12)
         sa = [t for t in a.trades if t.get("tao_received")]
         sb = [t for t in b.trades if t.get("tao_received")]
         self.assertAlmostEqual(sa[0]["alpha_yield_accrued"], sb[0]["alpha_yield_accrued"], places=9)
@@ -167,7 +172,7 @@ class TestEngineModes(unittest.TestCase):
     def test_falling_rate_engine(self):
         m = StepRateModel([(0, 0.01), (10 * DAY, 0.001)])
         a = _run(m, "anchor", sell_at=15)
-        b = _run(m, "path", sell_at=15)
+        b = _run(m, "path_simple", sell_at=15)
         sa = [t for t in a.trades if t.get("tao_received")][0]
         sb = [t for t in b.trades if t.get("tao_received")][0]
         ya, yb = sa["alpha_yield_accrued"], sb["alpha_yield_accrued"]

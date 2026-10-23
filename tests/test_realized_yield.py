@@ -175,12 +175,12 @@ def test_true_up_converges_to_realized_and_never_revalues_committed():
     ticks = [T0 + DAY + k * 3600 for k in range(0, 6 * 24 + 1)]     # hourly, 6 days
     pos, marks, _ = _ledger_walk(m, ticks)
     end = ticks[-1]
-    exact = 1000.0 * sum(rates["A"][1:7])                         # days 1..6 fully held
+    exact = 1000.0 * math.expm1(sum(rates["A"][1:7]))   # compounding (2026-10-22)                         # days 1..6 fully held
     # at the end, days 1..5 are realized (obs_day = 5 at day 7 00:00 + LAG? no:
     # end = day 7 00:00, obs_day = 5); day 6 is provisional at day 5's rate
     od = m.obs_day(end) - T0 // DAY
     assert od == 5
-    assert marks[-1][1] == pytest.approx(1000.0 * (sum(rates["A"][1:6]) + rates["A"][5]))
+    assert marks[-1][1] == pytest.approx(1000.0 * math.expm1(sum(rates["A"][1:6]) + rates["A"][5]))
     # after every day is observable, the same position reads exactly realized
     late = end + 2 * DAY
     assert ledger.accrued_yield(pos, end, lambda *a, **k: m.accrued_yield(
@@ -196,7 +196,7 @@ def test_true_up_converges_to_realized_and_never_revalues_committed():
     for _, _, c, to in marks:
         if to > T0 + DAY:
             k = int((to - T0) // DAY)
-            assert c == pytest.approx(1000.0 * sum(rates["A"][1:k]))
+            assert c == pytest.approx(1000.0 * math.expm1(sum(rates["A"][1:k])))
 
 
 def test_true_up_path_equals_engine_without_lag_when_all_known():
@@ -206,7 +206,7 @@ def test_true_up_path_equals_engine_without_lag_when_all_known():
     m = model(table(5, rates), observe_lag_s=-30 * DAY)
     ticks = [T0 + k * 1800 for k in range(0, 4 * 48 + 1)]
     pos, marks, _ = _ledger_walk(m, ticks)
-    assert marks[-1][1] == pytest.approx(1000.0 * sum(rates["A"][0:4]))
+    assert marks[-1][1] == pytest.approx(1000.0 * math.expm1(sum(rates["A"][0:4])))
 
 
 def test_legacy_position_keeps_its_old_total_at_switch():
@@ -228,7 +228,7 @@ def test_legacy_position_keeps_its_old_total_at_switch():
     assert ledger.accrued_yield(pos, t_switch, yfn) == pytest.approx(7.5)
     t1 = t_switch + 3600
     ledger.accrue_yield(pos, t1, yfn, commit_to=m.final_through(t1))
-    assert ledger.accrued_yield(pos, t1, yfn) == pytest.approx(7.5 + 1000 * 0.002 / 24)
+    assert ledger.accrued_yield(pos, t1, yfn) == pytest.approx(7.5 + 1007.5 * math.expm1(0.002 / 24))
 
 
 def test_reregistration_stops_accrual():
@@ -278,4 +278,4 @@ def test_engine_assigns_validator_and_credits_its_rate(hk, expect):
     rate = {"B": 0.002, "C": 0.0015}[expect]
     entry = pos.entry_time
     acc = ledger.accrued_yield(pos, ts, eng._yield_fn)
-    assert acc == pytest.approx(pos.alpha_qty * rate * (ts - entry) / DAY)
+    assert acc == pytest.approx(pos.alpha_qty * math.expm1(rate * (ts - entry) / DAY))

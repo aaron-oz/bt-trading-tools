@@ -188,6 +188,34 @@ Caution: the daily on-chain rate for date d is what was paid DURING d. Never use
 
 Remaining deviation: a fold (top-up, partial or full sell) fixes the provisional tail at that moment; it is not trued up afterwards. Paper does the same, so alignment holds, but both differ from a real stake by up to one day of the difference between the provisional and the realized rate on the folded alpha.
 
+## 10. SDK reserves before 2026-06-25 disagree with the price fills followed (measured 2026-10-21, fixed in `load_sdk_ticks` 2026-10-22)
+
+**What happens.** Until the chain's 2026-06-25 runtime change, swaps priced on the concentrated-liquidity sqrt price (`Swap.AlphaSqrtPrice`; price = sqrt price squared). The SDK snapshot's `price` column carries that sqrt price squared, but `tao_in / alpha_in` (the reserves the engine fills from, section 2) drifted away from it on some subnets. A backtest on raw SDK reserves therefore filled at a price no real trade saw. After the change (last sqrt-price snapshot block 8,486,580 at 2026-06-25 20:32:24 UTC; first reserve-priced snapshot block 8,486,655 at 20:47:24 UTC) the SDK prices from the reserves, and the old `AlphaSqrtPrice` values still in storage are stale and must not be used.
+
+**Measured.** On the chain-clock SDK file (2026-02-10 to 2026-06-25 20:32 UTC, 1,677,304 non-root subnet-snapshots): `price / (tao_in / alpha_in)` median absolute gap 0.055%, p90 0.63%, p99 5.9%; off by more than 1% on 113,791 rows (6.8%, 29 subnets), more than 5% on 23,848, more than 10% on 12,002. sn103 is the extreme regular case (ratio median 0.867, range 0.814 to 1.000); sn104 0.944, sn49 0.974, sn89 1.032. After the switch all 1,442,171 rows agree within 1.6e-6. On bagbot's live trades (alpha-trading `docs/bagbot_live_alignment_2026_10_21.org`): live fill / sqrt price squared, median 1.0006 over 43 sampled pre-switch trades, while live fill / reserve ratio ranged 0.86 to 1.03; sn103 buys April to June, engine price / live price, median 1.158 on raw reserves and 1.003 on reserves rescaled to `price`. In that replay the rescale closed about 5.2 TAO of a 15.8 TAO replay-minus-live gap over 2026-04-03 to 2026-10-21 (10 seeds).
+
+Not resolved: 357 rows on sn76 (2026-02-20) and sn97 (2026-03-13 to 03-16) have ratios beyond 1.5x either way (0.00005 to 6.1); which side is right there was not checked against the chain. They are rescaled like every other pre-switch row (no rows are dropped). Depth after the rescale is still the reserve-implied k, not the active liquidity L of the concentrated-liquidity pool, so price impact before 2026-06-25 remains an approximation.
+
+**What changed.** `load_sdk_ticks(..., sqrt_price_reserves=True)` (the default) rescales reserves of rows up to block `SDK_SQRT_PRICE_LAST_BLOCK` (or before `SDK_SQRT_PRICE_SWITCH_TS` when the file has no `block` column) to the row's `price` at constant k, and leaves later rows untouched. A `UserWarning` reports how many rows were rescaled and how many were off by more than 1% and 5%. `sqrt_price_reserves=False` reproduces the earlier raw-reserve ticks.
+
+**Who is affected.** Every backtest on SDK ticks that fills before 2026-06-25 20:40 UTC (local SDK ticks begin 2026-02-10), most on the subnets listed above. Custom tick builders that read the SDK CSV directly (not through `load_sdk_ticks`) are not fixed; apply `rescale_reserves_to_price` to pre-switch rows yourself.
+
+## 11. Yield accrued as simple interest between folds (measured 2026-10-21, fixed 2026-10-22)
+
+**What happens.** The ledger credited each interval's yield on the position's alpha only, not on the yield already credited since the last fold (a buy, sell or close folds yield into the position). Between folds that is simple interest; the chain compounds (dividends are added to stake every epoch, about 72 minutes).
+
+**Measured.** About 1 TAO held untouched on each of sn22, sn48 and sn63, 2026-04-26 to 2026-10-21 (178.5 days), bagbot's validator's realized daily rates: engine yield / simple accrual 0.9998 to 1.0000, engine yield / daily compounding of the same rates 0.867, 0.875 and 0.908. In bagbot's live-trade replay (frequent folds) replay yield was about 5.5% below live (35.1 against 37.16 TAO, part of it from rejected buys rather than compounding).
+
+**What changed.** `ledger.accrue_yield`, `accrued_yield`, `fold_yield`, `book_buy`, `book_sell` and `close_deregistered` take `compound=True` (default): each interval earns on alpha plus already-credited yield, compounding continuously within the interval, so a position's yield over any partition is `alpha x (exp(sum of r x dt) - 1)` (independent of tick cadence). Continuous compounding exceeds daily compounding by about `r^2 / 2` per day (0.085% of the yield on a 178-day hold at 0.15% per day) and per-epoch compounding by about 1/20 of that. `BacktestEngine(yield_accrual="path")` (default) compounds; `"path_simple"` is the 2026-10-10 to 2026-10-22 simple path accrual; `"anchor"` the pre-2026-10-10 formula. `PaperBotBase` takes the same modes (`PAPER_YIELD_ACCRUAL`), so paper and backtest stay identical. A yield model must be linear in `alpha_qty` (all in this package are).
+
+**Who is affected.** Every result with material yield: long holds and yield-heavy strategies most. For a stretch of T days between folds at a constant rate r per day, simple accrual is short by a fraction of about r x T / 2 of the yield (arithmetic: 1 - rT / (exp(rT) - 1)); at r = 0.15% per day that is about 2.2% of the yield for 30 days and 13% for 178 days. Not measured per strategy. Results computed before 2026-10-22 understate yield.
+
+## 12. Random buy rejection drops trades that really executed in alignment replays (measured 2026-10-21, option added 2026-10-22)
+
+**What happens.** `RealismConfig().buy_failure_rate` (0.03) rejects buys at random. That models attempts that might fail in a strategy backtest; in an alignment replay of chain trades known to have executed it removes real trades. Bagbot's replay lost a median 20.5 of 645 executed buys per seed (15 to 28 over 10 seeds), moving the replay by -2 to +8 TAO depending on the draw.
+
+**What changed.** `Order(known_executed=True)` makes the realism layer treat that order as if the failure rate were 0 (no draw, no rejection); slippage noise and the rate-tolerance check still apply. Default `False`, so strategy backtests are unchanged. A run with every order flagged draws exactly the realism numbers of a run with `buy_failure_rate=0`.
+
 ## Sparse presence
 
 The parquet loader emits a subnet only in hours where it traded (no forward fill), so a strategy that needs a subnet present every hour must handle gaps, and the set of subnets present at the first tick depends on the label convention.

@@ -40,6 +40,22 @@ Conventions (decided 2026-10-01, see
   example one loaded from a state file written before this change) starts
   from the old formula's value at its first accrual, so a restart onto this
   code does not move any position's yield.
+* **Yield compounds** (2026-10-22, ``compound=True``, the default). Each
+  interval's yield is earned on the position's alpha PLUS the yield already
+  credited since the last fold, and within an interval the rate compounds
+  continuously: an interval whose ``yield_fn`` gives simple fraction
+  ``f = yield / alpha`` credits ``(alpha + accrued) x (exp(f) - 1)``. Over any
+  partition into intervals the total is ``alpha x (exp(sum of f) - 1)``, so it
+  does not depend on the tick cadence. Before this, accrual between folds was
+  simple interest (``alpha x sum of f``), which on 178-day untouched holds was
+  9% to 13% below the chain's daily compounding of the same realized rates
+  (alpha-trading ``docs/bagbot_live_alignment_2026_10_21.org``). The chain
+  compounds per epoch (about 72 minutes), so continuous compounding differs
+  from it by about ``f^2 / 2`` per epoch, negligible at observed rates.
+  ``compound=False`` reproduces the 2026-10-10 to 2026-10-22 simple accrual
+  (``BacktestEngine(yield_accrual="path_simple")``, ``PaperBotBase``
+  ``PAPER_YIELD_ACCRUAL=path_simple``). The ``"anchor"`` modes are simple too.
+  ``yield_fn`` must be linear in ``alpha_qty`` (all models in this package are).
 * **A deregistered subnet pays a refund**, approximated as spot price times
   alpha at the last snapshot before the re-registration. That reproduced the
   project's measured SN103 payout within -2.9% (2026-09-22). Refunds measured
@@ -49,6 +65,7 @@ Conventions (decided 2026-10-01, see
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 from bt_trading_tools.amm import amm_sell
@@ -114,8 +131,15 @@ def accepts_kwarg(fn, name: str) -> bool:
 
 
 def _interval_yield(pos: Position, start: float, end: float,
-                    yield_fn: YieldFn, as_of: Optional[float] = None) -> float:
+                    yield_fn: YieldFn, as_of: Optional[float] = None,
+                    base: float = 0.0, compound: bool = False) -> float:
     """``yield_fn`` over ``[start, end]`` on the position's current alpha.
+
+    With ``compound`` the yield is earned on ``alpha_qty + base`` (``base`` =
+    yield already credited since the last fold) and compounds continuously
+    within the interval: ``(alpha + base) x expm1(f)`` with ``f`` the simple
+    fraction ``yield_fn`` returns for that alpha. Without it: ``yield_fn`` on
+    ``alpha_qty`` (simple accrual), ``base`` ignored.
 
     Optional keywords, passed only to a ``yield_fn`` that accepts them:
     ``origin`` (the yield anchor), ``hotkey`` (the position's validator, when
@@ -133,11 +157,23 @@ def _interval_yield(pos: Position, start: float, end: float,
         kw["hotkey"] = hk
     if as_of is not None and accepts_kwarg(yield_fn, "as_of"):
         kw["as_of"] = as_of
-    v = yield_fn(pos.netuid, pos.alpha_qty, start, end, **kw)
-    return max(0.0, float(v))
+    alpha = pos.alpha_qty + max(0.0, base) if compound else pos.alpha_qty
+    v = max(0.0, float(yield_fn(pos.netuid, alpha, start, end, **kw)))
+    if compound and alpha > 0 and v > 0:
+        v = alpha * math.expm1(v / alpha)
+    return v
 
 
-def accrued_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
+def _interval_fraction(pos: Position, start: float, end: float, yield_fn: YieldFn,
+                       as_of: Optional[float] = None) -> float:
+    """Simple yield fraction ``f`` over ``[start, end]`` (yield per alpha)."""
+    if pos.alpha_qty <= 0:
+        return 0.0
+    return _interval_yield(pos, start, end, yield_fn, as_of=as_of) / pos.alpha_qty
+
+
+def accrued_yield(pos: Position, now: float, yield_fn: Optional[YieldFn],
+                  compound: bool = True) -> float:
     """Alpha accrued since the position's yield anchor, not yet folded.
 
     Equals ``yield_accrued`` (credited interval by interval by
@@ -147,22 +183,30 @@ def accrued_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> flo
     ``yield_accrued_to`` (a deregistration close at the dead subnet's last
     snapshot, after ticks that already accrued past it), the overrun is
     removed at the rate ``yield_fn`` gives for it, floored at 0. With
-    ``yield_fn`` None there is no yield at all. Does not mutate.
+    ``yield_fn`` None there is no yield at all. ``compound`` (default): see
+    the module docstring; with it the overrun is removed by discounting
+    (``(alpha + base) x exp(-f) - alpha``). Does not mutate.
     """
     if yield_fn is None or pos.alpha_qty <= 0:
         return 0.0
     if pos.yield_accrued_to is None:
-        return _interval_yield(pos, yield_anchor(pos), now, yield_fn, as_of=now)
+        return _interval_yield(pos, yield_anchor(pos), now, yield_fn, as_of=now,
+                               compound=compound)
     base = max(0.0, float(pos.yield_accrued))
     if now >= pos.yield_accrued_to:
-        return base + _interval_yield(pos, pos.yield_accrued_to, now, yield_fn, as_of=now)
+        return base + _interval_yield(pos, pos.yield_accrued_to, now, yield_fn, as_of=now,
+                                      base=base, compound=compound)
+    if compound:
+        f = _interval_fraction(pos, max(now, yield_anchor(pos)), pos.yield_accrued_to,
+                               yield_fn, as_of=now)
+        return max(0.0, (pos.alpha_qty + base) * math.exp(-f) - pos.alpha_qty)
     overrun = _interval_yield(pos, max(now, yield_anchor(pos)),
                               pos.yield_accrued_to, yield_fn, as_of=now)
     return max(0.0, base - overrun)
 
 
 def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn],
-                 commit_to: Optional[float] = None) -> float:
+                 commit_to: Optional[float] = None, compound: bool = True) -> float:
     """Credit yield from ``yield_accrued_to`` (or the anchor) to ``now``.
 
     Call once per tick on every open position, before anything reads the
@@ -186,14 +230,15 @@ def accrue_yield(pos: Position, now: float, yield_fn: Optional[YieldFn],
         if commit_to <= start:
             return 0.0
         base = 0.0 if pos.yield_accrued_to is None else max(0.0, float(pos.yield_accrued))
-        add = _interval_yield(pos, start, commit_to, yield_fn, as_of=now)
+        add = _interval_yield(pos, start, commit_to, yield_fn, as_of=now,
+                              base=base, compound=compound)
         pos.yield_accrued = base + add
         pos.yield_accrued_to = commit_to
         return add
     if pos.yield_accrued_to is not None and now <= pos.yield_accrued_to:
         return 0.0
     before = 0.0 if pos.yield_accrued_to is None else max(0.0, float(pos.yield_accrued))
-    total = accrued_yield(pos, now, yield_fn)
+    total = accrued_yield(pos, now, yield_fn, compound=compound)
     pos.yield_accrued = total
     pos.yield_accrued_to = now
     return total - before
@@ -225,14 +270,15 @@ def clear_accrual(pos: Position) -> None:
     pos.yield_accrued_to = None
 
 
-def fold_yield(pos: Position, now: float, yield_fn: Optional[YieldFn]) -> float:
+def fold_yield(pos: Position, now: float, yield_fn: Optional[YieldFn],
+               compound: bool = True) -> float:
     """Add accrued yield to ``alpha_qty`` and restart the yield clock.
 
     Yield alpha has zero cost basis, so ``tao_cost`` is unchanged and the
     per-alpha cost basis (``entry_price``) falls slightly. Returns the alpha
     folded in.
     """
-    accrued = accrued_yield(pos, now, yield_fn)
+    accrued = accrued_yield(pos, now, yield_fn, compound=compound)
     if accrued > 0:
         pos.alpha_qty += accrued
         if pos.alpha_qty > 0:
@@ -254,6 +300,7 @@ def book_buy(
     generation: Optional[int] = None,
     yield_fn: Optional[YieldFn] = None,
     metadata: Optional[dict] = None,
+    compound: bool = True,
 ) -> Position:
     """Open a position or add to an existing one (cost-weighted).
 
@@ -283,7 +330,7 @@ def book_buy(
         raise GenerationMismatch(
             f"netuid {netuid}: buy in generation {generation} but the open "
             f"position is generation {pos.generation}")
-    fold_yield(pos, now, yield_fn)
+    fold_yield(pos, now, yield_fn, compound=compound)
     pos.alpha_qty += alpha_received
     pos.tao_cost += tao_spent
     pos.entry_fees += fee
@@ -302,6 +349,7 @@ def book_sell(
     now: float,
     *,
     yield_fn: Optional[YieldFn] = None,
+    compound: bool = True,
 ) -> dict:
     """Reduce a position by ``alpha_sold`` (after folding accrued yield).
 
@@ -310,7 +358,7 @@ def book_sell(
     accounting fields of the sell for the caller's trade record.
     """
     pos = positions[netuid]
-    folded = fold_yield(pos, now, yield_fn)
+    folded = fold_yield(pos, now, yield_fn, compound=compound)
     held = pos.alpha_qty
     alpha_sold = min(alpha_sold, held)
     fraction = alpha_sold / held if held > 0 else 1.0
@@ -372,6 +420,7 @@ def close_deregistered(
     last_seen_ts: float,
     *,
     yield_fn: Optional[YieldFn] = None,
+    compound: bool = True,
 ) -> dict:
     """Close a position whose subnet was deregistered, at the refund value.
 
@@ -379,7 +428,7 @@ def close_deregistered(
     beyond: after deregistration the alpha no longer exists.
     """
     pos = positions[netuid]
-    folded = fold_yield(pos, last_seen_ts, yield_fn)
+    folded = fold_yield(pos, last_seen_ts, yield_fn, compound=compound)
     alpha = pos.alpha_qty
     refund = dereg_refund(alpha, last_tao_pool, last_alpha_pool)
     record = {
