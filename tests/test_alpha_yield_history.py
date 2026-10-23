@@ -1,5 +1,6 @@
 """Point-in-time alpha yield rates from the validator yield history."""
 
+import math
 import unittest
 
 import pandas as pd
@@ -119,7 +120,7 @@ class TestEngineIntegration(unittest.TestCase):
         r = e.run(ticks, Script())
         sell = [t for t in r.trades if t.get("exit_time") is not None][0]
         alpha_bought = sell["alpha_qty"] - sell["alpha_yield_accrued"]
-        self.assertAlmostEqual(sell["alpha_yield_accrued"], alpha_bought * rate * 2.0, places=6)
+        self.assertAlmostEqual(sell["alpha_yield_accrued"], alpha_bought * math.expm1(rate * 2.0), places=6)
 
 
 if __name__ == "__main__":

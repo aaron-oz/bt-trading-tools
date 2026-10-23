@@ -107,10 +107,48 @@ def coerce_to_utc_timestamp(t) -> pd.Timestamp:
 # ── SDK CSV → TickData ────────────────────────────────────────────────
 
 
+# The 2026-06-25 runtime change (measured 2026-10-22 on the chain-clock SDK file,
+# alpha-trading docs/bagbot_live_alignment_2026_10_21.org). Up to and including
+# block 8,486,580 (2026-06-25 20:32:24 UTC) the SDK ``price`` column is the chain's
+# Swap.AlphaSqrtPrice squared, which is what real fills followed; ``tao_in /
+# alpha_in`` disagreed with it by more than 1% on 113,764 of 1,676,920 non-root
+# rows (6.8%) from 2026-02-10 to the switch (sn103 by 11% to 16%). From block
+# 8,486,655 (20:47:24 UTC) on, the SDK prices from tao_in / alpha_in itself (all
+# 1,442,043 later rows agree within 1.6e-6) and the old AlphaSqrtPrice values
+# left in storage are stale, so they must not be used. Rows without a block
+# column fall back to the timestamp cut below (between the two snapshots).
+SDK_SQRT_PRICE_LAST_BLOCK = 8_486_580
+SDK_SQRT_PRICE_SWITCH_TS = "2026-06-25 20:40:00+00:00"
+
+
+def _rescale_pre_switch(df: pd.DataFrame) -> dict:
+    """Rescale reserves of pre-switch SDK rows to the row's ``price`` at constant
+    k (vectorized ``rescale_reserves_to_price``). Mutates ``df``; returns counts."""
+    if "block" in df.columns and df["block"].notna().all():
+        pre = df["block"] <= SDK_SQRT_PRICE_LAST_BLOCK
+    else:
+        pre = df["timestamp"] < pd.Timestamp(SDK_SQRT_PRICE_SWITCH_TS)
+    sub = df.loc[pre]
+    ratio = sub["price"] / (sub["tao_in"] / sub["alpha_in"])
+    k = sub["tao_in"] * sub["alpha_in"]
+    df.loc[pre, "tao_in"] = (k * sub["price"]) ** 0.5
+    df.loc[pre, "alpha_in"] = (k / sub["price"]) ** 0.5
+    gap = (ratio - 1.0).abs()
+    nonroot = sub["netuid"] != 0
+    return {
+        "rows_pre_switch": int(pre.sum()),
+        "rows_gap_gt_1pct": int((gap[nonroot] > 0.01).sum()),
+        "rows_gap_gt_5pct": int((gap[nonroot] > 0.05).sum()),
+        "subnets_gap_gt_1pct": int(sub.loc[nonroot & (gap > 0.01), "netuid"].nunique()),
+        "median_abs_gap": float(gap[nonroot].median()) if nonroot.any() else 0.0,
+    }
+
+
 def load_sdk_ticks(
     start, end,
     csv_path: Union[str, Path] = DEFAULT_SDK_POOL_STATE_CSV,
     stamp_identity: bool = True,
+    sqrt_price_reserves: bool = True,
 ) -> list:
     """Build TickData list from SDK pool-state CSV (15-minute cadence).
 
@@ -127,6 +165,14 @@ def load_sdk_ticks(
     ``generation`` so BacktestEngine can close a position whose netuid was
     re-registered (see bt_trading_tools.utils.lifecycle).
 
+    With ``sqrt_price_reserves`` (default, 2026-10-22) rows from before the
+    2026-06-25 runtime change (``SDK_SQRT_PRICE_LAST_BLOCK``) get their reserves
+    rescaled to the row's ``price`` (the chain sqrt price squared) at constant
+    k, the pool price real fills followed; depth stays reserve-implied, not the
+    active liquidity. Rows after the change are untouched (price and reserves
+    agree there). A ``UserWarning`` reports the counts. ``False`` reproduces
+    the earlier behavior (raw reserves everywhere). See docs/known_traps.md.
+
     Returns
     -------
     list[TickData]
@@ -136,17 +182,26 @@ def load_sdk_ticks(
 
     start_ts = coerce_to_utc_timestamp(start)
     end_ts = coerce_to_utc_timestamp(end)
-    df = pd.read_csv(
-        csv_path,
-        usecols=["timestamp", "netuid", "price", "tao_in", "alpha_in", "alpha_out"],
-    )
+    cols = {"timestamp", "block", "netuid", "price", "tao_in", "alpha_in", "alpha_out"}
+    df = pd.read_csv(csv_path, usecols=lambda c: c in cols)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     # Detect on the window plus a day of lead-in, BEFORE the zero-pool filter
     # below (a dying pool's last rows are part of the signal).
     lead = df[(df["timestamp"] >= start_ts - pd.Timedelta(days=1))
               & (df["timestamp"] <= end_ts)]
     df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
-    df = df[(df["price"] > 0) & (df["tao_in"] > 0) & (df["alpha_in"] > 0)]
+    df = df[(df["price"] > 0) & (df["tao_in"] > 0) & (df["alpha_in"] > 0)].copy()
+    if sqrt_price_reserves and len(df):
+        c = _rescale_pre_switch(df)
+        if c["rows_pre_switch"]:
+            warnings.warn(
+                "load_sdk_ticks: rescaled reserves to the SDK price (chain sqrt price) "
+                f"on {c['rows_pre_switch']} rows before the 2026-06-25 runtime change "
+                f"(block <= {SDK_SQRT_PRICE_LAST_BLOCK}); reserve ratio was off by >1% on "
+                f"{c['rows_gap_gt_1pct']} rows ({c['subnets_gap_gt_1pct']} subnets), >5% on "
+                f"{c['rows_gap_gt_5pct']}; median |gap| {c['median_abs_gap']:.2e}. "
+                "Pass sqrt_price_reserves=False for raw reserves. See docs/known_traps.md.",
+                UserWarning, stacklevel=2)
     df["unix_ts"] = to_unix_seconds(df["timestamp"])
 
     ticks = []

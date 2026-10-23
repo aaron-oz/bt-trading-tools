@@ -168,4 +168,4 @@ def test_engine_uses_clamped_subnet_model(tmp_path):
     sell = [t for t in r.trades if t.get("exit_time") is not None][0]
     alpha_bought = sell["alpha_qty"] - sell["alpha_yield_accrued"]
     # rows dated days 1..3 accrue; day 2 is rejected -> 2 days at 0.001/day
-    assert sell["alpha_yield_accrued"] == pytest.approx(alpha_bought * 0.001 * 2.0, rel=1e-6)
+    assert sell["alpha_yield_accrued"] == pytest.approx(alpha_bought * math.expm1(0.001 * 2.0), rel=1e-6)

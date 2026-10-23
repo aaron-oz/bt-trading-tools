@@ -196,6 +196,10 @@ class RealismSimulator:
             self.config.buy_failure_rate if side == "buy"
             else self.config.sell_failure_rate
         )
+        # ``known_executed`` (a replay of a trade that did execute, 2026-10-22):
+        # behave exactly as with failure_rate 0 (no draw, no rejection).
+        if action.get("known_executed"):
+            failure_rate = 0.0
         if failure_rate > 0 and self._rng.random() < failure_rate:
             action["status"] = "failed"
             action["failure_reason"] = "random_reject"

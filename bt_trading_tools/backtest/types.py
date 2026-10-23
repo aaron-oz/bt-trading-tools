@@ -95,6 +95,15 @@ class Order:
     # None (default) = decision pool is the tick pool, the previous behavior.
     decision_tao_pool: float | None = None
     decision_alpha_pool: float | None = None
+    # Replay of a trade known to have executed (2026-10-22). Alignment work
+    # replays real chain trades; the realism layer's random rejection
+    # (``RealismConfig.buy_failure_rate`` / ``sell_failure_rate``) would drop
+    # some of them (about 20 of bagbot's 645 executed buys per seed). With this
+    # True the order is treated as if the failure rate were 0 (no rejection
+    # draw), so the RNG stream equals a run with buy_failure_rate=0. Slippage
+    # noise and the rate-tolerance check still apply. Leave False for strategy
+    # backtests: there the orders are hypothetical and may fail.
+    known_executed: bool = False
 
 
 @runtime_checkable

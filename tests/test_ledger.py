@@ -1,5 +1,6 @@
 """Tests for bt_trading_tools.ledger (shared position bookkeeping)."""
 
+import math
 import unittest
 
 import pandas as pd
@@ -36,14 +37,18 @@ class TestBuy(unittest.TestCase):
     def test_top_up_does_not_give_new_lot_back_yield(self):
         # 10%/day. Lot A: 100 alpha at t=0. Lot B: 100 alpha at day 1.
         # At day 2 accrued should be A: 100*0.1*1 folded at day 1 = 10,
-        # then (110 + 100) * 0.1 * 1 = 21. Old behavior (anchor at first
-        # entry) would give 200 * 0.1 * 2 = 40.
+        # then (110 + 100) * 0.1 * 1 = 21 with simple accrual; compounding
+        # (default since 2026-10-22) replaces each 0.1 with expm1(0.1). Old
+        # behavior (anchor at first entry) would give 200 * 0.1 * 2 = 40.
         y = flat_yield(0.10)
         pos = {}
         ledger.book_buy(pos, 1, 100, 1.0, 0.0, now=0, yield_fn=y)
         ledger.book_buy(pos, 1, 100, 1.0, 0.0, now=86400, yield_fn=y)
-        self.assertAlmostEqual(pos[1].alpha_qty, 210)
-        self.assertAlmostEqual(ledger.accrued_yield(pos[1], 2 * 86400, y), 21.0)
+        g = math.expm1(0.10)
+        self.assertAlmostEqual(pos[1].alpha_qty, 200 + 100 * g)
+        self.assertAlmostEqual(ledger.accrued_yield(pos[1], 2 * 86400, y), (200 + 100 * g) * g)
+        self.assertAlmostEqual(ledger.accrued_yield(pos[1], 2 * 86400, y, compound=False),
+                               (200 + 100 * g) * 0.10)
 
     def test_generation_mismatch_raises(self):
         pos = {}
@@ -77,9 +82,9 @@ class TestSell(unittest.TestCase):
         y = flat_yield(0.01)
         pos = {}
         ledger.book_buy(pos, 2, 100, 1.0, 0.0, now=0, yield_fn=y)
-        rec = ledger.book_sell(pos, 2, alpha_sold=101, tao_received=1.2, fee=0.0,
+        rec = ledger.book_sell(pos, 2, alpha_sold=200, tao_received=1.2, fee=0.0,
                                now=86400, yield_fn=y)
-        self.assertAlmostEqual(rec["alpha_yield_accrued"], 1.0)
+        self.assertAlmostEqual(rec["alpha_yield_accrued"], 100 * math.expm1(0.01))
         self.assertTrue(rec["position_closed"])
         self.assertAlmostEqual(rec["tao_cost"], 1.0)
 
@@ -104,8 +109,8 @@ class TestValuation(unittest.TestCase):
         rec = ledger.close_deregistered(pos, 9, last_tao_pool=10, last_alpha_pool=1000,
                                         last_seen_ts=86400, yield_fn=y)
         self.assertNotIn(9, pos)
-        self.assertAlmostEqual(rec["alpha_qty"], 110)
-        self.assertAlmostEqual(rec["tao_received"], 110 * 0.01)
+        self.assertAlmostEqual(rec["alpha_qty"], 100 * math.exp(0.10))
+        self.assertAlmostEqual(rec["tao_received"], 100 * math.exp(0.10) * 0.01)
         self.assertEqual(rec["generation"], 0)
 
 

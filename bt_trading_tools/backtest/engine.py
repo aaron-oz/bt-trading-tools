@@ -72,6 +72,10 @@ def _hybrid(order: Order) -> bool:
 RESERVE_GAP_SHARE_WARN = 0.10
 RESERVE_GAP_MIN_ORDERS = 10
 
+# Yield accrual modes (see BacktestEngine.__init__ and bt_trading_tools.ledger).
+YIELD_ACCRUAL_MODES = ("path", "path_simple", "anchor")
+
+
 # Same-seed trap: every engine built with the same ``realism_rng_seed``
 # replays the same realism draws. Averaging many near-single-trade runs under
 # one seed therefore averages one draw, not many. Heuristic guard: after this
@@ -193,11 +197,15 @@ class BacktestEngine:
                 before 2026-10-14, when paper ran it on. Construct via:
                 ``PoolSafetyChecker(DataFramePoolHistoryProvider(pool_history_df))``.
 
-            yield_accrual: ``"path"`` (default since 2026-10-10): every open
+            yield_accrual: ``"path"`` (default since 2026-10-10; compounding
+                since 2026-10-22): every open
                 position's yield is credited once per tick over the interval
                 since the previous tick (``ledger.accrue_yield``), so each
                 interval is paid at its own rate and past accrual is never
-                revalued. ``"anchor"``: the pre-2026-10-10 formula, the rate
+                revalued; yield compounds on yield already credited (see
+                ``bt_trading_tools.ledger``). ``"path_simple"``: the same
+                without compounding (the 2026-10-10 to 2026-10-22 default),
+                for regression comparisons. ``"anchor"``: the pre-2026-10-10 formula, the rate
                 at the sale or mark applied to the whole time since the
                 position's yield anchor. Kept for regression comparisons; it
                 must match the paper bots' ``PaperBotBase.yield_accrual`` for
@@ -259,10 +267,14 @@ class BacktestEngine:
             rng_seed=realism_rng_seed,
         )
         self.pool_safety_checker = pool_safety_checker
-        if yield_accrual not in ("path", "anchor"):
+        if yield_accrual not in YIELD_ACCRUAL_MODES:
             raise ValueError(
-                f"yield_accrual must be 'path' or 'anchor', got {yield_accrual!r}")
-        self.yield_accrual = yield_accrual
+                f"yield_accrual must be one of {YIELD_ACCRUAL_MODES}, got {yield_accrual!r}")
+        # "path" compounds (2026-10-22); "path_simple" is the 2026-10-10 path
+        # accrual without compounding; "anchor" the pre-2026-10-10 formula.
+        self.yield_accrual = "path" if yield_accrual == "path_simple" else yield_accrual
+        self.yield_accrual_mode = yield_accrual
+        self._compound = yield_accrual == "path"
         self._orders_checked = 0
         self._orders_gap = 0
 
@@ -346,7 +358,7 @@ class BacktestEngine:
                 for _pos in positions.values():
                     self._assign_validator(_pos, tick.timestamp)
                     ledger.accrue_yield(_pos, tick.timestamp, self._yield_fn,
-                                        commit_to=_commit)
+                                        commit_to=_commit, compound=self._compound)
             else:
                 for _pos in positions.values():
                     ledger.clear_accrual(_pos)
@@ -426,7 +438,7 @@ class BacktestEngine:
                 pos = positions[netuid]
                 st, exit_source = self._state_for(pos, last_tick)
                 eff_alpha = pos.alpha_qty + ledger.accrued_yield(
-                    pos, last_tick.timestamp, self._yield_fn)
+                    pos, last_tick.timestamp, self._yield_fn, compound=self._compound)
                 if st is not None and st.tao_pool > 0 and st.alpha_pool > 0:
                     fee, fee_components = self._sell_fee(
                         netuid, eff_alpha, st.tao_pool, st.alpha_pool,
@@ -441,7 +453,7 @@ class BacktestEngine:
                     exit_source = "entry_fallback" if st is None else exit_source
                 rec = ledger.book_sell(
                     positions, netuid, eff_alpha, tao_received, fee,
-                    last_tick.timestamp, yield_fn=self._yield_fn,
+                    last_tick.timestamp, yield_fn=self._yield_fn, compound=self._compound,
                 )
                 capital += tao_received
                 trade = {
@@ -552,7 +564,7 @@ class BacktestEngine:
                 old_ts, tao_pool, alpha_pool = pos.entry_time, 0.0, 0.0
             rec = ledger.close_deregistered(
                 positions, netuid, tao_pool, alpha_pool, old_ts,
-                yield_fn=self._yield_fn,
+                yield_fn=self._yield_fn, compound=self._compound,
             )
             capital += rec["tao_received"]
             trade = {
@@ -679,6 +691,7 @@ class BacktestEngine:
             "price": eff_price,
             "decision_pool_tao": st.tao_pool,
             "decision_pool_alpha": st.alpha_pool,
+            "known_executed": bool(getattr(order, "known_executed", False)),
         }
         if _hybrid(order):
             # Mirror PaperBotBase.adjust_action_with_live_pool: the order was
@@ -709,7 +722,7 @@ class BacktestEngine:
         _pos = ledger.book_buy(
             positions, order.netuid, alpha_received, spend, fee, tick.timestamp,
             generation=st.generation, yield_fn=self._yield_fn,
-            metadata=order.signal_data,
+            metadata=order.signal_data, compound=self._compound,
         )
         self._assign_validator(_pos, tick.timestamp,
                                (order.signal_data or {}).get("validator_hotkey"))
@@ -755,7 +768,7 @@ class BacktestEngine:
             return None
 
         held = pos.alpha_qty + ledger.accrued_yield(
-            pos, tick.timestamp, self._yield_fn)
+            pos, tick.timestamp, self._yield_fn, compound=self._compound)
         if order.alpha_amount <= 0:
             alpha_to_sell = held
         else:
@@ -796,6 +809,7 @@ class BacktestEngine:
             "exit_price": tao_received / alpha_to_sell if alpha_to_sell > 0 else 0,
             "decision_pool_tao": use_pool_tao,
             "decision_pool_alpha": use_pool_alpha,
+            "known_executed": bool(getattr(order, "known_executed", False)),
         }
         if _hybrid(order):
             d_fee, _ = self._sell_fee(order.netuid, alpha_to_sell, order.decision_tao_pool,
@@ -822,7 +836,7 @@ class BacktestEngine:
 
         rec = ledger.book_sell(
             positions, order.netuid, alpha_to_sell, tao_received, fee,
-            tick.timestamp, yield_fn=self._yield_fn,
+            tick.timestamp, yield_fn=self._yield_fn, compound=self._compound,
         )
         trade = {
             "netuid": order.netuid,
@@ -939,7 +953,7 @@ class BacktestEngine:
         for netuid, pos in positions.items():
             st, _ = self._state_for(pos, tick)
             eff_alpha = pos.alpha_qty + ledger.accrued_yield(
-                pos, tick.timestamp, self._yield_fn)
+                pos, tick.timestamp, self._yield_fn, compound=self._compound)
             if st is not None and st.tao_pool > 0 and st.alpha_pool > 0:
                 fee, _ = self._sell_fee(netuid, eff_alpha, st.tao_pool, st.alpha_pool)
                 value += ledger.liquidation_value(
